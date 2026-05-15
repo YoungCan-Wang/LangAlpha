@@ -93,7 +93,12 @@ docs/libs
 docs/superpowers/
 docs/api/
 docs/api/environments/production.yml
+docs/videos/
 .worktrees/
 .superpowers/
 .gstack/
 TODO.md
+
+# Per-developer skills (canonical) and Claude Code's symlinked mirror — both local-only.
+.agents/
+.claude/

@@ -10,11 +10,6 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License" />
 </p>
 
-> [!NOTE]
-> **Gemini 3 Hackathon** — If you're a judge or reviewer for the [Gemini 3 Hackathon](https://gemini3.devpost.com/), please refer to the [`hackathon/gemini-3`](https://github.com/ginlix-ai/langalpha/tree/hackathon/gemini-3) branch for the frozen submission. This `main` branch contains ongoing development beyond the submission.
-
----
-
 <p align="center">
   <a href="#getting-started">Getting Started</a> &bull;
   <a href="docs/api/README.md">API Docs</a> &bull;
@@ -27,9 +22,9 @@
 </p>
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/c3935d9a-73fd-4f34-bad8-af4c6233f355" autoplay loop muted playsinline width="900"></video>
+  <video src="https://github.com/user-attachments/assets/56ec23b5-e9af-46ab-8505-66a7dff822a4" autoplay loop muted playsinline width="900"></video>
 </p>
-<p align="center"><em>Activated with a skill, the agent dispatches parallel subagents to gather market data, news, and macro context, then presents a morning note with inline interactive visualizations.</em></p>
+<p align="center"><em>Pin a curated news brief from the dashboard, kick off idea generation, and dispatch parallel subagents to screen the market — then get five long/short pair-trade ideas in an inline interactive dashboard, calibrated to your book.</em></p>
 
 ## Why LangAlpha
 
@@ -147,9 +142,9 @@ In addition, the workspace environment enables persistence beyond a single sessi
 <p align="center"><em>Each workspace maps to a persistent sandbox — organize research by theme, portfolio, or thesis.</em></p>
 
 <p align="center">
-  <img src="docs/images/chat-data-center-research-with-value-chain-dashboard.png" alt="PTC agent generating an AI compute value chain dashboard with supply chain analysis" width="800" />
+  <img src="docs/images/chat-mag7-catalyst-calendar-dashboard.png" alt="PTC agent generating a Mag 7 + Semiconductors catalyst calendar dashboard" width="800" />
 </p>
-<p align="center"><em>The agent writes code to build interactive dashboards — here analyzing the AI compute supply chain via PTC.</em></p>
+<p align="center"><em>The agent writes code to build interactive dashboards — here, a Mag 7 + Semiconductors catalyst calendar.</em></p>
 
 ### Financial Data Ecosystem
 
@@ -188,11 +183,6 @@ All tiers are enabled by default. To run with **free data only** (Yahoo Finance)
 > [!NOTE]
 > Yahoo Finance data is community-sourced and has limitations: no intraday data below 1-hour intervals, delayed quotes, limited macro coverage, and occasional rate limiting. An `FMP_API_KEY` is strongly recommended ([free tier available](https://site.financialmodelingprep.com/)).
 
-<p align="center">
-  <img src="docs/images/chat-nvda-amd-googl-comps-analysis-with-stock-cards.png" alt="Comparable company analysis with live NVDA, AMD, and GOOGL stock cards" width="800" />
-</p>
-<p align="center"><em>Native financial data tools render live stock cards inline while the agent runs a comps analysis.</em></p>
-
 ### Financial Research Skills
 
 The agent ships with 23 pre-built financial research skills, each activatable by slash command or automatic detection. Skills follow the [Agent Skills Spec](https://agentskills.io/specification) and can be extended by dropping a `SKILL.md` file into the workspace.
@@ -210,18 +200,18 @@ The agent ships with 23 pre-built financial research skills, each activatable by
 Acknowledgement: some of skills are adapted from [anthropics/financial-services-plugins](https://github.com/anthropics/financial-services-plugins).
 
 <p align="center">
-  <img src="docs/images/chat-comparable-company-valuation-pdf-report.png" alt="Comps Analysis skill generating an Excel workbook and PDF report for NVDA, AMD, and GOOGL" width="800" />
+  <img src="docs/images/chat-nvda-amd-googl-comps-implied-valuation.png" alt="Comps Analysis skill delivering an Excel model and PDF valuation report with implied price ranges for NVDA, AMD, and GOOGL" width="800" />
 </p>
-<p align="center"><em>The Comps Analysis skill builds a multi-sheet Excel workbook with operating metrics and valuation multiples.</em></p>
+<p align="center"><em>The Comps Analysis skill ships an Excel model and a PDF report — with implied price ranges from peer-group multiples.</em></p>
 
 ### Multimodal Intelligence
 
 The agent natively reads images (PNG, JPG, GIF, WebP) and PDFs — the multimodal middleware intercepts file reads, downloads content from the sandbox or URLs, and injects it as base64 into the conversation for direct visual interpretation. In MarketView, the user's live candlestick chart can be captured and sent to the agent as multimodal context — the capture includes both the chart image and structured metadata (symbol, interval, OHLCV, moving averages, RSI, 52-week range) so the agent can reason about both the visual pattern and the underlying data.
 
 <p align="center">
-  <img src="docs/images/marketview-googl-intraday-chart-with-ai-analysis.png" alt="MarketView showing GOOGL intraday candlestick chart with AI technical analysis" width="800" />
+  <img src="docs/images/marketview-nvda-support-resistance-analysis.png" alt="MarketView showing NVDA candlestick chart with AI support and resistance analysis" width="800" />
 </p>
-<p align="center"><em>MarketView captures the live chart and sends it to the agent for real-time technical analysis.</em></p>
+<p align="center"><em>MarketView sends the live chart to the agent for real-time technical analysis.</em></p>
 
 ### Automations
 
@@ -244,9 +234,9 @@ Conditions can be combined (AND logic), and each price automation supports **one
 > Price-triggered automations require the real-time WebSocket feed from ginlix-data. During the beta, this feature is available exclusively on the [hosted platform](https://ginlix.ai). Broader WebSocket data source support is planned for future releases.
 
 <p align="center">
-  <img src="docs/images/automations-page-earnings-pre-analysis-schedules.png" alt="Automations page with scheduled earnings pre-analysis tasks" width="800" />
+  <img src="docs/images/automations-page-mag7-pre-earnings.png" alt="Automations page with template gallery and Mag 7 pre-earnings schedule" width="800" />
 </p>
-<p align="center"><em>Schedule recurring research — here, pre-earnings analysis for major tech stocks runs automatically before each report.</em></p>
+<p align="center"><em>Schedule recurring research — here, Mag 7 pre-earnings analyses run automatically ahead of each report.</em></p>
 
 **Agent Architecture**
 
@@ -312,9 +302,9 @@ The core agent runs on [LangGraph](https://github.com/langchain-ai/langgraph) an
 Beyond simple dispatch, the main agent can send follow-up instructions to a still-running subagent via `Task(action="update")`, or resume a completed subagent with full checkpoint context via `Task(action="resume")` for iterative refinement. If the server restarts, subagent state is automatically reconstructed from LangGraph checkpoints.
 
 <p align="center">
-  <img src="docs/images/chat-ai-compute-timeline-dashboard.png" alt="Parallel subagents building an AI compute timeline dashboard" width="800" />
+  <img src="docs/images/chat-data-center-moat-ai-compute-timeline.png" alt="Parallel subagents researching the data center compute chain with an interactive AI compute timeline" width="800" />
 </p>
-<p align="center"><em>Three research subagents run in parallel, each covering a different chip family — results merge into an interactive timeline.</em></p>
+<p align="center"><em>Research subagents run in parallel across the compute chain — results merge into an interactive AI compute timeline spanning NVIDIA, Google, AMD, AWS, and the rest of the industry.</em></p>
 
 ### Middleware Stack
 
@@ -367,6 +357,7 @@ Vault secrets inherit every protection layer above — encrypted at rest, redact
 
 The web UI is more than a chat interface — it's a full research workbench:
 
+- **Configurable dashboard** — start from a preset layout (Morning Brief, Agent Desk, Researcher, Trader) or build your own from a widget gallery covering markets, intelligence, personal context, agent surfaces, and workspace shortcuts
 - **Inline financial charts** — tool results render as interactive sparklines, bar charts, and overview cards directly in the chat thread
 - **Inline HTML widgets** — the agent can render interactive HTML/SVG visualizations (Chart.js charts, metric cards, data tables) directly in the chat via the `ShowWidget` tool, with theme-aware styling and sandboxed iframes
 - **Multi-format file viewer** — PDF (paginated, zoomable), Excel, CSV, HTML preview, and source code (Monaco editor with diff mode) — all viewable inline without download
@@ -377,9 +368,24 @@ The web UI is more than a chat interface — it's a full research workbench:
 - **Automations** — CRUD management with cron builder, execution history, manual trigger, and price-triggered automations that fire when a stock or index hits a real-time price condition
 
 <p align="center">
-  <img src="docs/images/dashboard-market-overview-with-news-and-portfolio.png" alt="Dashboard with market indices, news, portfolio, and earnings calendar" width="800" />
+  <img src="docs/images/dashboard-market-overview-news-watchlist.png" alt="Dashboard with market index strip, market news brief, and watchlist — with a news brief dropped into the agent chat as context" width="800" />
 </p>
-<p align="center"><em>The dashboard surfaces market indices, personalized news, portfolio tracking, and upcoming earnings at a glance.</em></p>
+<p align="center"><em>The dashboard surfaces market indices, a personalized brief, and your watchlist — any tile can be pinned to the agent as chat context to kick off a research thread.</em></p>
+
+<table align="center">
+  <tr>
+    <td width="50%">
+      <img src="docs/images/dashboard-preset-picker-morning-brief.png" alt="Dashboard preset picker with Morning Brief, Agent Desk, Researcher, and Trader templates" />
+    </td>
+    <td width="50%">
+      <img src="docs/images/dashboard-widget-gallery-add-widget.png" alt="Dashboard widget gallery with markets, intelligence, personal, agent, and workspace categories" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><em>Start from a curated preset — Morning Brief, Agent Desk, Researcher, or Trader.</em></td>
+    <td align="center"><em>Or compose your own from the widget gallery — markets, intelligence, personal, agent, and workspace.</em></td>
+  </tr>
+</table>
 
 ## Channel Integrations
 
