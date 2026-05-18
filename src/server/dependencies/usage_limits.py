@@ -223,7 +223,11 @@ async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
 
 
 async def _enforce_byok_negative_balance(user_id: str) -> None:
-    """Raise 429 when remaining_credits < 0 (outstanding debt from past platform usage). Cached 60 s."""
+    """Raise 429 when ``outstanding_debt > 0``. Cached 60 s.
+
+    Gates on ``outstanding_debt`` rather than ``remaining_credits`` because the
+    latter uses ``-1`` / ``-2`` as unlimited-tier sentinels.
+    """
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
@@ -254,10 +258,9 @@ async def _enforce_byok_negative_balance(user_id: str) -> None:
     if result is None:
         return  # Fail-open
 
-    quota = result.get("quota")
-    remaining = quota.get("remaining_credits") if quota else None
-
-    is_negative = remaining is not None and remaining < 0
+    quota = result.get("quota") or {}
+    debt = int(quota.get("outstanding_debt") or 0)
+    is_negative = debt > 0
 
     if cache.enabled and cache.client:
         try:
@@ -275,15 +278,16 @@ async def _enforce_byok_negative_balance(user_id: str) -> None:
             detail={
                 "message": "Outstanding credit balance. Please add credits to continue.",
                 "type": "negative_balance",
+                "outstanding_debt": debt,
                 "used_credits": quota.get("used_credits"),
                 "credit_limit": quota.get("credit_limit"),
-                "remaining_credits": remaining,
+                "remaining_credits": quota.get("remaining_credits"),
                 "retry_after": quota.get("retry_after", 30),
             },
             headers={
                 "Retry-After": str(quota.get("retry_after") or 30),
                 "X-RateLimit-Limit": str(quota.get("credit_limit", "")),
-                "X-RateLimit-Remaining": str(remaining),
+                "X-RateLimit-Remaining": str(quota.get("remaining_credits", "")),
             },
         )
 

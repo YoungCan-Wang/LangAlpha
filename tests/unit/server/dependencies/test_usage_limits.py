@@ -300,14 +300,12 @@ class TestEnforceCreditLimitByok:
     """
 
     @pytest.mark.asyncio
-    async def test_byok_negative_balance_raises_429(self):
-        """byok=True with negative remaining_credits raises 429 with type=negative_balance."""
+    async def test_byok_outstanding_debt_raises_429(self):
+        """byok=True with outstanding_debt > 0 raises 429 with type=negative_balance."""
         quota_response = {
             "quota": {
                 "allowed": True,
-                "remaining_credits": -5.0,
-                "used_credits": 105.0,
-                "credit_limit": 100.0,
+                "outstanding_debt": 100,
                 "retry_after": 30,
             }
         }
@@ -325,16 +323,21 @@ class TestEnforceCreditLimitByok:
 
             assert exc_info.value.status_code == 429
             assert exc_info.value.detail["type"] == "negative_balance"
+            assert exc_info.value.detail["outstanding_debt"] == 100
 
     @pytest.mark.asyncio
-    async def test_byok_positive_balance_passes(self):
-        """byok=True with positive remaining_credits should not raise, even if allowed=False."""
+    async def test_byok_unlimited_sentinel_does_not_block(self):
+        """Regression: remaining_credits=-1 (unlimited sentinel) MUST NOT block.
+
+        Pre-fix bug: langalpha treated remaining_credits<0 as outstanding debt,
+        but ginlix-platform uses -1 for unlimited tiers. This caused BYOK users
+        on unlimited plans (or daily-unlimited plans) to be permanently blocked.
+        """
         quota_response = {
             "quota": {
-                "allowed": False,
-                "remaining_credits": 50.0,
-                "used_credits": 50.0,
-                "credit_limit": 100.0,
+                "allowed": True,
+                "remaining_credits": -1,  # unlimited sentinel
+                "outstanding_debt": 0,
             }
         }
 
@@ -349,14 +352,13 @@ class TestEnforceCreditLimitByok:
             await enforce_credit_limit("user-1", byok=True)
 
     @pytest.mark.asyncio
-    async def test_byok_zero_balance_passes(self):
-        """byok=True with remaining_credits=0 should not raise (zero is not negative)."""
+    async def test_byok_zero_debt_passes(self):
+        """byok=True with outstanding_debt=0 should not raise, even if quota.allowed=False."""
         quota_response = {
             "quota": {
                 "allowed": False,
                 "remaining_credits": 0,
-                "used_credits": 100.0,
-                "credit_limit": 100.0,
+                "outstanding_debt": 0,
             }
         }
 
@@ -371,13 +373,12 @@ class TestEnforceCreditLimitByok:
             await enforce_credit_limit("user-1", byok=True)
 
     @pytest.mark.asyncio
-    async def test_byok_none_remaining_passes(self):
-        """byok=True with remaining_credits=None should not raise (missing field = no block)."""
+    async def test_byok_missing_debt_field_passes(self):
+        """Wire-compat: older platform builds without outstanding_debt → no block."""
         quota_response = {
             "quota": {
                 "allowed": False,
-                "used_credits": 100.0,
-                "credit_limit": 100.0,
+                "remaining_credits": -1,  # would have blocked under old code
             }
         }
 
