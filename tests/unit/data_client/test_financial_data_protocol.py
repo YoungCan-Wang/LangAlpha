@@ -139,10 +139,10 @@ class TestFMPFinancialSource:
     @pytest.mark.asyncio
     async def test_get_earnings_history(self, source):
         src, client = source
-        client.get_historical_earnings_calendar.return_value = [{"eps": 1.5}]
+        client.get_historical_earnings_calendar.return_value = [{"epsActual": 1.5}]
         result = await src.get_earnings_history("AAPL", limit=5)
         client.get_historical_earnings_calendar.assert_awaited_once_with("AAPL", limit=5)
-        assert result == [{"eps": 1.5}]
+        assert result == [{"epsActual": 1.5}]
 
     @pytest.mark.asyncio
     async def test_get_revenue_by_segment_product(self, source):
@@ -163,9 +163,17 @@ class TestFMPFinancialSource:
     @pytest.mark.asyncio
     async def test_get_sector_performance(self, source):
         src, client = source
-        client._make_request.return_value = [{"sector": "Tech"}]
+        client.get_sector_performance.return_value = [{"sector": "Tech"}]
         result = await src.get_sector_performance()
-        client._make_request.assert_awaited_once()
+        client.get_sector_performance.assert_awaited_once_with(None)
+        assert result == [{"sector": "Tech"}]
+
+    @pytest.mark.asyncio
+    async def test_get_sector_performance_with_date(self, source):
+        src, client = source
+        client.get_sector_performance.return_value = [{"sector": "Tech"}]
+        result = await src.get_sector_performance(target_date="2026-05-22")
+        client.get_sector_performance.assert_awaited_once_with("2026-05-22")
         assert result == [{"sector": "Tech"}]
 
     @pytest.mark.asyncio

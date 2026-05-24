@@ -115,9 +115,9 @@ def _build_fiscal_period_lookup(income_stmt: List[Dict]) -> Dict[str, str]:
     for stmt in income_stmt:
         stmt_date = stmt.get("date")
         period = stmt.get("period")  # Q1, Q2, Q3, Q4
-        calendar_year = stmt.get("calendarYear")
-        if stmt_date and period and calendar_year:
-            lookup[stmt_date] = f"{period} FY{calendar_year}"
+        fiscal_year = stmt.get("fiscalYear")
+        if stmt_date and period and fiscal_year:
+            lookup[stmt_date] = f"{period} FY{fiscal_year}"
     return lookup
 
 
@@ -405,7 +405,7 @@ def _format_sectors_as_table(sectors_data: List[Dict[str, Any]]) -> str:
     parsed_sectors = []
     for sector in sectors_data:
         sector_name = sector.get("sector", "N/A")
-        change_str = sector.get("changesPercentage", "0%")
+        change_str = sector.get("changePctStr", "0%")
 
         # Parse percentage (handle formats like "+1.50%" or "-0.42%")
         try:
@@ -1065,7 +1065,7 @@ async def fetch_company_overview_data(symbol: str) -> Dict[str, Any]:
         artifact["quote"] = {
             "price": quote.get("price"),
             "change": quote.get("change"),
-            "changePct": quote.get("changesPercentage"),
+            "changePct": quote.get("changePercentage"),
             "dayHigh": quote.get("dayHigh"),
             "dayLow": quote.get("dayLow"),
             "yearHigh": quote.get("yearHigh"),
@@ -1139,7 +1139,7 @@ async def fetch_company_overview_data(symbol: str) -> Dict[str, Any]:
 
     # Earnings surprises (reported only, oldest-first)
     reported_for_artifact = [
-        e for e in earnings_calendar if e.get("eps") is not None
+        e for e in earnings_calendar if e.get("epsActual") is not None
     ]
     if reported_for_artifact:
         artifact["earningsSurprises"] = [
@@ -1148,9 +1148,9 @@ async def fetch_company_overview_data(symbol: str) -> Dict[str, Any]:
                     e.get("fiscalDateEnding"), e.get("date", "")
                 ),
                 "date": e.get("date"),
-                "epsActual": e.get("eps"),
+                "epsActual": e.get("epsActual"),
                 "epsEstimate": e.get("epsEstimated"),
-                "revenueActual": e.get("revenue"),
+                "revenueActual": e.get("revenueActual"),
                 "revenueEstimate": e.get("revenueEstimated"),
             }
             for e in reversed(reported_for_artifact)
@@ -1219,7 +1219,7 @@ No data found for symbol {symbol}"""
         company_name = profile.get("companyName", symbol)
         sector = profile.get("sector", "N/A")
         industry = profile.get("industry", "N/A")
-        market_cap = profile.get("mktCap")
+        market_cap = profile.get("marketCap")
         price = profile.get("price")
         exchange = profile.get("exchangeShortName", "N/A")
 
@@ -1463,7 +1463,7 @@ No data found for symbol {symbol}"""
 
                 q_price = quote.get("price", 0)
                 q_change = quote.get("change", 0)
-                q_change_pct = quote.get("changesPercentage", 0)
+                q_change_pct = quote.get("changePercentage", 0)
                 change_sign = "+" if q_change >= 0 else ""
                 output_lines.append(
                     f"**Price:** ${q_price:.2f} ({change_sign}{q_change:.2f} / {change_sign}{q_change_pct:.2f}%)"
@@ -1692,7 +1692,7 @@ No data found for symbol {symbol}"""
             # Show latest 10-K (annual report that includes Q4)
             if filings_10k:
                 for filing in filings_10k[:1]:  # Just the latest
-                    filing_date = filing.get("fillingDate", "N/A")
+                    filing_date = filing.get("filingDate", "N/A")
                     if filing_date and " " in filing_date:
                         filing_date = filing_date.split(" ")[0]  # Remove time part
 
@@ -1715,7 +1715,7 @@ No data found for symbol {symbol}"""
             # Show latest 10-Q filings
             if filings_10q:
                 for filing in filings_10q[:3]:  # Last 3 quarterly reports
-                    filing_date = filing.get("fillingDate", "N/A")
+                    filing_date = filing.get("filingDate", "N/A")
                     if filing_date and " " in filing_date:
                         filing_date = filing_date.split(" ")[0]
 
@@ -1740,11 +1740,11 @@ No data found for symbol {symbol}"""
 
         # === NEXT EARNINGS REPORT ===
         if earnings_calendar:
-            # Find upcoming reports (eps is None) and pick the earliest one
+            # Find upcoming reports (epsActual is None) and pick the earliest one
             upcoming_reports = [
                 cal
                 for cal in earnings_calendar
-                if cal.get("eps") is None and cal.get("date")
+                if cal.get("epsActual") is None and cal.get("date")
             ]
 
             if upcoming_reports:
@@ -1788,8 +1788,8 @@ No data found for symbol {symbol}"""
                 output_lines.append("")
 
         # === EARNINGS PERFORMANCE ===
-        # Filter to get reported quarters only (eps is not None means already reported)
-        reported_earnings = [e for e in earnings_calendar if e.get("eps") is not None]
+        # Filter to get reported quarters only (epsActual is not None means already reported)
+        reported_earnings = [e for e in earnings_calendar if e.get("epsActual") is not None]
 
         if reported_earnings:
             output_lines.append("### Earnings Performance")
@@ -1799,9 +1799,9 @@ No data found for symbol {symbol}"""
             latest = reported_earnings[0]
             announce_date = latest.get("date", "N/A")
             fiscal_ending = latest.get("fiscalDateEnding")
-            eps_actual = latest.get("eps")
+            eps_actual = latest.get("epsActual")
             eps_estimate = latest.get("epsEstimated")
-            revenue_actual = latest.get("revenue")
+            revenue_actual = latest.get("revenueActual")
             revenue_estimate = latest.get("revenueEstimated")
 
             # Get fiscal period label
@@ -1854,8 +1854,8 @@ No data found for symbol {symbol}"""
                 for quarter in reported_earnings[:4]:
                     q_date = quarter.get("date", "N/A")
                     q_fiscal_ending = quarter.get("fiscalDateEnding")
-                    q_eps = quarter.get("eps")
-                    q_revenue = quarter.get("revenue")
+                    q_eps = quarter.get("epsActual")
+                    q_revenue = quarter.get("revenueActual")
 
                     # Get fiscal period label
                     q_fiscal_label = (
@@ -2144,7 +2144,7 @@ No data found for symbol {symbol}"""
             artifact["quote"] = {
                 "price": quote.get("price"),
                 "change": quote.get("change"),
-                "changePct": quote.get("changesPercentage"),
+                "changePct": quote.get("changePercentage"),
                 "dayHigh": quote.get("dayHigh"),
                 "dayLow": quote.get("dayLow"),
                 "yearHigh": quote.get("yearHigh"),
@@ -2218,7 +2218,7 @@ No data found for symbol {symbol}"""
 
         # Earnings surprises from earnings calendar (reported only, oldest-first)
         reported_for_artifact = [
-            e for e in earnings_calendar if e.get("eps") is not None
+            e for e in earnings_calendar if e.get("epsActual") is not None
         ]
         if reported_for_artifact:
             artifact["earningsSurprises"] = [
@@ -2227,9 +2227,9 @@ No data found for symbol {symbol}"""
                         e.get("fiscalDateEnding"), e.get("date", "")
                     ),
                     "date": e.get("date"),
-                    "epsActual": e.get("eps"),
+                    "epsActual": e.get("epsActual"),
                     "epsEstimate": e.get("epsEstimated"),
-                    "revenueActual": e.get("revenue"),
+                    "revenueActual": e.get("revenueActual"),
                     "revenueEstimate": e.get("revenueEstimated"),
                 }
                 for e in reversed(reported_for_artifact)
@@ -2544,14 +2544,14 @@ async def fetch_sector_performance(
         sectors = []
         for sector in raw_results:
             sector_name = sector.get("sector", "N/A")
-            change_str = sector.get("changesPercentage", "0%")
+            change_str = sector.get("changePctStr", "0%")
             try:
                 change_val = float(change_str.replace("%", "").replace("+", ""))
             except (ValueError, AttributeError):
                 change_val = 0.0
-            sectors.append({"sector": sector_name, "changesPercentage": change_val})
+            sectors.append({"sector": sector_name, "changePercentage": change_val})
         # Sort descending by performance
-        sectors.sort(key=lambda x: x["changesPercentage"], reverse=True)
+        sectors.sort(key=lambda x: x["changePercentage"], reverse=True)
         return {"type": "sector_performance", "sectors": sectors}
 
     try:
@@ -2559,6 +2559,7 @@ async def fetch_sector_performance(
 
         # Generate file-ready header
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        requested_date = date or datetime.now(timezone.utc).date().isoformat()
         date_str = f" ({date})" if date else ""
         header = f"""## Sector Performance Analysis{date_str}
 **Retrieved:** {timestamp}
@@ -2566,32 +2567,29 @@ async def fetch_sector_performance(
 
 """
 
-        # Try protocol-based provider first
+        # Protocol path — passes date through to FMP's date-aware endpoint;
+        # yfinance ignores `target_date` and always returns today's snapshot.
         if provider.financial is not None:
             try:
-                results = await provider.financial.get_sector_performance()
-                if results:
-                    logger.debug(f"Retrieved performance data for {len(results)} sectors")
-                    content = header + _format_sectors_as_table(results)
-                    return content, _build_sector_artifact(results)
-            except Exception:
-                pass
-
-        # Fallback to stable version with date if provided
-        if date:
-            try:
-                results = await _fmp_request(
-                    "_make_request",
-                    "sector-performance-snapshot",
-                    params={"date": date},
-                    version="stable",
+                results = await provider.financial.get_sector_performance(
+                    target_date=date
                 )
                 if results:
                     logger.debug(f"Retrieved performance data for {len(results)} sectors")
-                    content = header + _format_sectors_as_table(results)
+                    actual_date = results[0].get("date") if isinstance(results[0], dict) else None
+                    if actual_date and actual_date != requested_date:
+                        fallback_notice = (
+                            f"> ⚠️ **No data for {requested_date}** "
+                            f"(weekend / holiday / not yet published). "
+                            f"Showing the most recent available trading day: "
+                            f"**{actual_date}**.\n\n"
+                        )
+                        content = header + fallback_notice + _format_sectors_as_table(results)
+                    else:
+                        content = header + _format_sectors_as_table(results)
                     return content, _build_sector_artifact(results)
             except Exception:
-                pass
+                logger.exception("Sector performance provider call failed")
 
         logger.warning(
             "No sector performance data found - endpoint may not be available on this FMP plan"
@@ -2873,7 +2871,7 @@ async def fetch_stock_screener(
             sect = stock.get("sector", "N/A")
             beta = stock.get("beta")
             volume = stock.get("volume")
-            change = stock.get("changes")
+            change = stock.get("change")
 
             price_str = f"${price:.2f}" if price is not None else "N/A"
             cap_str = format_number(mkt_cap) if mkt_cap is not None else "N/A"
