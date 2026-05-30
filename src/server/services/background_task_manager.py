@@ -515,7 +515,7 @@ class BackgroundTaskManager:
                     existing.completion_callback = completion_callback
                     existing.graph = graph
                     existing.task = asyncio.create_task(
-                        self._run_workflow_shielded(
+                        self._run_workflow(
                             thread_id, run_id, workflow_generator,
                             cancel_event=existing.cancel_event,
                             soft_interrupt_event=existing.soft_interrupt_event,
@@ -553,7 +553,7 @@ class BackgroundTaskManager:
             )
 
             task_info.task = asyncio.create_task(
-                self._run_workflow_shielded(
+                self._run_workflow(
                     thread_id, run_id, workflow_generator,
                     cancel_event=task_info.cancel_event,
                     soft_interrupt_event=task_info.soft_interrupt_event,
@@ -571,7 +571,7 @@ class BackgroundTaskManager:
 
             return task_info
 
-    async def _run_workflow_shielded(
+    async def _run_workflow(
         self,
         thread_id: str,
         run_id: str,
@@ -579,7 +579,12 @@ class BackgroundTaskManager:
         cancel_event: asyncio.Event,
         soft_interrupt_event: asyncio.Event,
     ):
-        """Run workflow with shield protection and cooperative cancellation."""
+        """Drive the workflow generator with cooperative cancellation.
+
+        Lifecycle is driven solely by ``cancel_event`` / ``soft_interrupt_event``;
+        no SSE consumer holds a reference to this task post-Streams cutover,
+        so disconnect cannot cascade and the inner task is awaited directly.
+        """
         key = (thread_id, run_id)
         try:
             async def consume_workflow(wf_gen):
@@ -604,7 +609,7 @@ class BackgroundTaskManager:
                 if task_info:
                     task_info.inner_task = inner_task
 
-            await asyncio.shield(inner_task)
+            await inner_task
 
             await self._mark_completed(thread_id, run_id)
 
@@ -1772,6 +1777,10 @@ class BackgroundTaskManager:
             task_info.status = TaskStatus.CANCELLED
             task_info.completed_at = datetime.now()
             metadata = task_info.metadata
+            # Only user-driven cancels set explicit_cancel; system force-cancels
+            # (shutdown timeout, abandoned-task cleanup) reach here via task.cancel()
+            # with the flag unset and must not be persisted as user actions.
+            cancelled_by_user = bool(task_info.explicit_cancel)
 
         logger.debug(f"[BackgroundTaskManager] Marked as cancelled: {key}")
 
@@ -1809,7 +1818,7 @@ class BackgroundTaskManager:
                     "agent_llm_preset": metadata.get("agent_llm_preset", "default"),
                     "deepthinking": metadata.get("deepthinking", False),
                     "is_byok": metadata.get("is_byok", False),
-                    "cancelled_by_user": True,
+                    "cancelled_by_user": cancelled_by_user,
                 }
 
                 await persistence_service.persist_cancelled(

@@ -5,11 +5,13 @@ Covers:
 - cancel_stale_workflow no-ops for missing or completed tasks
 - cancel_stale_workflow cancels RUNNING and SOFT_INTERRUPTED tasks
 - cancel_stale_workflow handles timeout when task won't exit
-- _run_workflow_shielded uses closure-captured events (not re-acquired from lock)
+- _run_workflow uses closure-captured events (not re-acquired from lock)
+- Outer-task .cancel() propagates into inner consume_workflow (post-shield-removal)
 """
 
 import asyncio
 import logging
+from contextlib import suppress
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -286,10 +288,10 @@ class TestConsumeWorkflowUsesClosureEvents:
 
     @pytest.mark.asyncio
     async def test_consume_workflow_uses_closure_events(self):
-        """_run_workflow_shielded checks the cancel_event passed as a parameter.
+        """_run_workflow checks the cancel_event passed as a parameter.
 
-        The cancel_event passed to _run_workflow_shielded is captured by the
-        inner consume_workflow closure.  When that event is set, the workflow
+        The cancel_event passed to _run_workflow is captured by the inner
+        consume_workflow closure. When that event is set, the workflow
         should stop — proving the closure uses the parameter, not a fresh
         lookup from self.tasks.
         """
@@ -304,14 +306,14 @@ class TestConsumeWorkflowUsesClosureEvents:
         cancel_event = asyncio.Event()
         soft_interrupt_event = asyncio.Event()
 
-        # Pre-register a RUNNING task so _run_workflow_shielded can find it
+        # Pre-register a RUNNING task so _run_workflow can find it
         task_info = _make_task_info(thread_id="thread-closure", status=TaskStatus.RUNNING)
         btm.tasks[("thread-closure", "run-1")] = task_info
 
         # Patch _mark_completed, _mark_cancelled, _mark_failed, _mark_soft_interrupted
         # so they don't try to do real persistence work
-        with patch.object(btm, "_mark_completed", new_callable=AsyncMock), \
-             patch.object(btm, "_mark_cancelled", new_callable=AsyncMock), \
+        with patch.object(btm, "_mark_completed", new_callable=AsyncMock) as mock_mark_completed, \
+             patch.object(btm, "_mark_cancelled", new_callable=AsyncMock) as mock_mark_cancelled, \
              patch.object(btm, "_mark_failed", new_callable=AsyncMock), \
              patch.object(btm, "_mark_soft_interrupted", new_callable=AsyncMock), \
              patch.object(btm, "_flush_checkpoint", new_callable=AsyncMock):
@@ -323,25 +325,164 @@ class TestConsumeWorkflowUsesClosureEvents:
 
             cancel_task = asyncio.create_task(set_cancel_after_delay())
 
-            # Run the shielded workflow — it should exit early via CancelledError
+            # Run the workflow — it should exit early via CancelledError
             # because cancel_event gets set after ~5 events
-            try:
-                await btm._run_workflow_shielded(
+            with pytest.raises(asyncio.CancelledError):
+                await btm._run_workflow(
                     thread_id="thread-closure",
                     run_id="run-1",
                     workflow_generator=fake_workflow(),
                     cancel_event=cancel_event,
                     soft_interrupt_event=soft_interrupt_event,
                 )
-            except asyncio.CancelledError:
-                pass  # Expected when cancel_event triggers
 
             await cancel_task
 
         # The workflow should NOT have consumed all 20 events — it should
-        # have been cut short by the cancel_event being set
+        # have been cut short by the cancel_event being set.
         assert cancel_event.is_set()
-        # Verify _mark_cancelled was called (proof that CancelledError path ran)
-        # or _mark_completed was not called with all events consumed
-        # The key assertion: the inner task was registered on the task_info
+        # The closure observed the cancel_event: cancellation path ran and the
+        # completion path did not. Without these the test false-passes even if
+        # _run_workflow ignored the event and ran to completion.
+        mock_mark_cancelled.assert_awaited_once_with("thread-closure", "run-1")
+        mock_mark_completed.assert_not_awaited()
+        # The inner task was registered on the task_info.
         assert task_info.inner_task is not None
+
+
+# ---------------------------------------------------------------------------
+# Force-cancel propagates from outer task into inner consume_workflow
+# ---------------------------------------------------------------------------
+
+class TestOuterTaskCancelPropagatesToInner:
+
+    @pytest.mark.asyncio
+    async def test_outer_task_cancel_propagates_to_inner(self):
+        """Cancelling the outer task that wraps _run_workflow now cancels the
+        inner consume_workflow task and runs _mark_cancelled.
+
+        Pinpoints the behavior change from removing ``asyncio.shield(inner_task)``:
+        shutdown's force-cancel path (background_task_manager.py:367) and
+        _cleanup_abandoned_tasks (line 432) both call ``info.task.cancel()``.
+        Pre-shield-removal: inner_task kept running orphaned; post-removal:
+        cancellation propagates through ``await inner_task`` and the workflow
+        generator is closed cleanly.
+        """
+        btm = _make_btm()
+
+        generator_closed = asyncio.Event()
+
+        async def fake_workflow():
+            try:
+                for i in range(1000):
+                    await asyncio.sleep(0.01)
+                    yield f"event-{i}"
+            finally:
+                generator_closed.set()
+
+        cancel_event = asyncio.Event()
+        soft_interrupt_event = asyncio.Event()
+
+        task_info = _make_task_info(
+            thread_id="thread-outer", run_id="run-outer", status=TaskStatus.RUNNING
+        )
+        btm.tasks[("thread-outer", "run-outer")] = task_info
+
+        with patch.object(btm, "_mark_completed", new_callable=AsyncMock), \
+             patch.object(btm, "_mark_cancelled", new_callable=AsyncMock) as mock_mark_cancelled, \
+             patch.object(btm, "_mark_failed", new_callable=AsyncMock), \
+             patch.object(btm, "_mark_soft_interrupted", new_callable=AsyncMock), \
+             patch.object(btm, "_flush_checkpoint", new_callable=AsyncMock):
+
+            outer_task = asyncio.create_task(
+                btm._run_workflow(
+                    thread_id="thread-outer",
+                    run_id="run-outer",
+                    workflow_generator=fake_workflow(),
+                    cancel_event=cancel_event,
+                    soft_interrupt_event=soft_interrupt_event,
+                )
+            )
+
+            # Let the inner task spin up and register itself.
+            await asyncio.sleep(0.05)
+            assert task_info.inner_task is not None
+            inner_task = task_info.inner_task
+
+            # Simulate shutdown / abandoned-cleanup directly cancelling
+            # the outer task — the path that previously hit the shield.
+            outer_task.cancel()
+
+            with suppress(asyncio.CancelledError):
+                await outer_task
+
+        # The cooperative cancel_event was never set — proves the cancellation
+        # arrived via the outer task, not the cooperative path.
+        assert not cancel_event.is_set()
+        # Inner task is now done (shield removal lets the cancel propagate).
+        assert inner_task.done()
+        assert inner_task.cancelled()
+        # _mark_cancelled ran inside the except handler.
+        mock_mark_cancelled.assert_awaited_once_with("thread-outer", "run-outer")
+        # The workflow generator's finally block ran — no orphaned generator.
+        assert generator_closed.is_set()
+
+
+# ---------------------------------------------------------------------------
+# _mark_cancelled labels persistence by cancel origin (explicit_cancel)
+# ---------------------------------------------------------------------------
+
+class TestMarkCancelledUserLabeling:
+    """``cancelled_by_user`` must reflect ``task_info.explicit_cancel``.
+
+    User cancels (cancel_workflow / cancel_stale_workflow) set explicit_cancel.
+    System force-cancels (shutdown timeout, abandoned-task cleanup) reach
+    _mark_cancelled via task.cancel() with the flag unset and must persist
+    cancelled_by_user=False so analytics don't attribute them to the user.
+    """
+
+    async def _run_mark_cancelled(self, btm, task_info):
+        """Drive _mark_cancelled's persistence path and return the persist kwargs."""
+        persistence_service = MagicMock()
+        persistence_service.persist_cancelled = AsyncMock(return_value="resp-id")
+        task_info.metadata = {
+            "workspace_id": "ws-1",
+            "user_id": "user-1",
+            "persistence_service": persistence_service,
+        }
+        btm.tasks[(task_info.thread_id, task_info.run_id)] = task_info
+
+        mod = "src.server.services.background_task_manager"
+        with patch(f"{mod}.get_token_usage_from_callback", return_value=(None, [])), \
+             patch(f"{mod}.get_tool_usage_from_handler", return_value={}), \
+             patch(f"{mod}.get_sse_events_from_handler", return_value=[]), \
+             patch(f"{mod}.calculate_execution_time", return_value=1.0), \
+             patch(f"{mod}.release_burst_slot", new_callable=AsyncMock), \
+             patch(f"{mod}.WorkflowTracker") as mock_tracker_cls:
+            mock_tracker_cls.get_instance.return_value.mark_cancelled = AsyncMock()
+            await btm._mark_cancelled(task_info.thread_id, task_info.run_id)
+
+        persistence_service.persist_cancelled.assert_awaited_once()
+        return persistence_service.persist_cancelled.await_args.kwargs["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_system_cancel_persists_not_user(self):
+        """explicit_cancel unset (force-cancel) → cancelled_by_user=False."""
+        btm = _make_btm()
+        task_info = _make_task_info(thread_id="thread-sys", run_id="run-sys")
+        assert task_info.explicit_cancel is False
+
+        persist_metadata = await self._run_mark_cancelled(btm, task_info)
+
+        assert persist_metadata["cancelled_by_user"] is False
+
+    @pytest.mark.asyncio
+    async def test_user_cancel_persists_user(self):
+        """explicit_cancel set (cancel_workflow) → cancelled_by_user=True."""
+        btm = _make_btm()
+        task_info = _make_task_info(thread_id="thread-usr", run_id="run-usr")
+        task_info.explicit_cancel = True
+
+        persist_metadata = await self._run_mark_cancelled(btm, task_info)
+
+        assert persist_metadata["cancelled_by_user"] is True
