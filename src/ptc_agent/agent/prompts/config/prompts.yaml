@@ -60,6 +60,9 @@ components:
   visualizations:
     description: Visualization instructions
 
+  trading_constraints:
+    description: Market trading-unit constraints for actionable recommendations
+
   output_guidelines:
     description: Output formatting guidelines
 
