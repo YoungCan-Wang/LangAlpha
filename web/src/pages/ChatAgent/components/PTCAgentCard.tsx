@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { FlaskConical, Loader2, Check, X, ChevronRight, ExternalLink } from 'lucide-react';
+import { FlaskConical, Loader2, Check, X, ChevronRight, ExternalLink, Activity, AlertCircle, Clock, Wrench } from 'lucide-react';
+import { getWorkflowStatus, reconnectToWorkflowStream } from '../utils/api';
 
 interface ProposalData {
   workspace_name?: string;
@@ -24,6 +25,444 @@ interface PTCAgentCardProps {
   flashContext?: FlashContext | null;
 }
 
+type ProgressPhase = 'idle' | 'waiting' | 'running' | 'completed' | 'failed' | 'disconnected';
+type ToolStepStatus = 'running' | 'completed' | 'failed';
+
+interface ToolStep {
+  id: string;
+  label: string;
+  status: ToolStepStatus;
+}
+
+interface ProgressState {
+  phase: ProgressPhase;
+  statusText: string;
+  completedSteps: number;
+  totalSteps: number;
+  activeLabel: string | null;
+  latestText: string | null;
+  error: string | null;
+  runId: string | null;
+  tools: ToolStep[];
+}
+
+interface WorkflowStatusSnapshot {
+  status?: string;
+  can_reconnect?: boolean;
+  run_id?: string | null;
+  active_tasks?: unknown[];
+}
+
+const INITIAL_PROGRESS: ProgressState = {
+  phase: 'idle',
+  statusText: 'Waiting for analysis to start',
+  completedSteps: 0,
+  totalSteps: 0,
+  activeLabel: null,
+  latestText: null,
+  error: null,
+  runId: null,
+  tools: [],
+};
+
+const TERMINAL_STATUS = new Set(['completed', 'cancelled', 'failed', 'soft_interrupted']);
+
+const TOOL_LABELS: Record<string, string> = {
+  execute_code: 'Running Python analysis',
+  bash: 'Running shell command',
+  Read: 'Reading workspace file',
+  Write: 'Writing workspace file',
+  Edit: 'Editing workspace file',
+  Glob: 'Scanning files',
+  Grep: 'Searching files',
+  web_search: 'Searching the web',
+  web_fetch: 'Fetching web source',
+  get_stock_daily_prices: 'Loading market prices',
+  get_company_overview: 'Loading company data',
+  get_sec_filing: 'Reading SEC filing',
+  screen_stocks: 'Screening stocks',
+  TodoWrite: 'Updating plan',
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function humanizeToolName(name?: string): string {
+  if (!name) return 'Running tool';
+  if (TOOL_LABELS[name]) return TOOL_LABELS[name];
+  return name
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function compactText(value: unknown, maxLength = 180): string | null {
+  if (value == null) return null;
+  let text = '';
+  if (typeof value === 'string') {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      return null;
+    }
+  }
+  const cleaned = text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength - 1)}...` : cleaned;
+}
+
+function isToolFailure(content: unknown): boolean {
+  if (typeof content !== 'string') return false;
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    return parsed?.success === false || Boolean(parsed?.error);
+  } catch {
+    return /\b(error|failed|traceback|exception)\b/i.test(content);
+  }
+}
+
+function phaseFromStatus(status: string | undefined): ProgressPhase | null {
+  if (!status) return null;
+  if (status === 'active') return 'running';
+  if (status === 'completed') return 'completed';
+  if (TERMINAL_STATUS.has(status)) return 'failed';
+  return null;
+}
+
+function updateFromStatus(prev: ProgressState, snapshot: WorkflowStatusSnapshot): ProgressState {
+  const statusPhase = phaseFromStatus(snapshot.status);
+  const activeTasks = Array.isArray(snapshot.active_tasks) ? snapshot.active_tasks.length : 0;
+  const nextPhase = statusPhase ?? (snapshot.can_reconnect ? 'running' : prev.phase);
+  const activeLabel = activeTasks > 0
+    ? `${activeTasks} background task${activeTasks === 1 ? '' : 's'} running`
+    : prev.activeLabel;
+
+  if (nextPhase === 'completed') {
+    return {
+      ...prev,
+      phase: 'completed',
+      statusText: 'Analysis complete',
+      completedSteps: Math.max(prev.completedSteps, prev.totalSteps),
+      activeLabel: null,
+      error: null,
+      runId: snapshot.run_id || prev.runId,
+    };
+  }
+
+  if (nextPhase === 'failed') {
+    return {
+      ...prev,
+      phase: 'failed',
+      statusText: snapshot.status === 'cancelled' ? 'Analysis cancelled' : 'Analysis stopped',
+      activeLabel: null,
+      error: snapshot.status || 'failed',
+      runId: snapshot.run_id || prev.runId,
+    };
+  }
+
+  if (nextPhase === 'running') {
+    return {
+      ...prev,
+      phase: 'running',
+      statusText: 'Analysis running',
+      activeLabel,
+      error: null,
+      runId: snapshot.run_id || prev.runId,
+    };
+  }
+
+  return {
+    ...prev,
+    runId: snapshot.run_id || prev.runId,
+  };
+}
+
+function usePtcProgress(threadId: string | undefined, enabled: boolean): ProgressState {
+  const [progress, setProgress] = useState<ProgressState>(INITIAL_PROGRESS);
+  const lastEventIdRef = useRef<number | null>(null);
+  const finalTextRef = useRef('');
+
+  const handleEvent = useCallback((event: Record<string, unknown>) => {
+    const eventType = typeof event.event === 'string' ? event.event : 'message_chunk';
+    const eventId = event._eventId;
+    if (typeof eventId === 'number') {
+      lastEventIdRef.current = eventId;
+    }
+
+    if (eventType === 'metadata') {
+      setProgress((prev) => ({
+        ...prev,
+        phase: 'running',
+        statusText: 'Analysis running',
+        runId: typeof event.run_id === 'string' ? event.run_id : prev.runId,
+        error: null,
+      }));
+      return;
+    }
+
+    if (eventType === 'workflow_status') {
+      setProgress((prev) => updateFromStatus(prev, event as WorkflowStatusSnapshot));
+      return;
+    }
+
+    if (eventType === 'reasoning_signal') {
+      const isComplete = event.content === 'complete';
+      setProgress((prev) => ({
+        ...prev,
+        phase: prev.phase === 'idle' || prev.phase === 'waiting' ? 'running' : prev.phase,
+        statusText: 'Analysis running',
+        activeLabel: isComplete ? 'Reasoning complete' : 'Reasoning through next step',
+      }));
+      return;
+    }
+
+    if (eventType === 'reasoning_content') {
+      const latest = compactText(event.content);
+      if (!latest) return;
+      setProgress((prev) => ({
+        ...prev,
+        phase: prev.phase === 'idle' || prev.phase === 'waiting' ? 'running' : prev.phase,
+        latestText: latest,
+        activeLabel: 'Reasoning through next step',
+      }));
+      return;
+    }
+
+    if (eventType === 'tool_calls') {
+      const calls = Array.isArray(event.tool_calls) ? event.tool_calls as Array<Record<string, unknown>> : [];
+      if (calls.length === 0) return;
+      setProgress((prev) => {
+        const existing = new Set(prev.tools.map((tool) => tool.id));
+        const additions: ToolStep[] = calls
+          .map((call, idx) => ({
+            id: String(call.id || `${Date.now()}-${idx}`),
+            label: humanizeToolName(typeof call.name === 'string' ? call.name : undefined),
+            status: 'running' as const,
+          }))
+          .filter((tool) => !existing.has(tool.id));
+        if (additions.length === 0) return prev;
+        const tools = [...prev.tools, ...additions].slice(-5);
+        return {
+          ...prev,
+          phase: 'running',
+          statusText: 'Analysis running',
+          totalSteps: prev.totalSteps + additions.length,
+          activeLabel: additions[additions.length - 1]?.label || prev.activeLabel,
+          tools,
+          error: null,
+        };
+      });
+      return;
+    }
+
+    if (eventType === 'tool_call_result') {
+      const toolCallId = typeof event.tool_call_id === 'string' ? event.tool_call_id : null;
+      const failed = isToolFailure(event.content);
+      const latest = compactText(event.content, 140);
+      setProgress((prev) => {
+        let countedCompletion = false;
+        let found = false;
+        const tools = prev.tools.map((tool) => {
+          if (tool.id !== toolCallId) return tool;
+          found = true;
+          if (tool.status === 'running') countedCompletion = true;
+          return { ...tool, status: failed ? 'failed' as const : 'completed' as const };
+        });
+        const nextTools = found
+          ? tools
+          : [
+              ...tools,
+              {
+                id: toolCallId || `result-${Date.now()}`,
+                label: 'Completed tool step',
+                status: failed ? 'failed' as const : 'completed' as const,
+              },
+            ].slice(-5);
+        return {
+          ...prev,
+          phase: prev.phase === 'completed' || prev.phase === 'failed' ? prev.phase : 'running',
+          statusText: failed ? 'Tool step returned an error' : 'Analysis running',
+          completedSteps: prev.completedSteps + (countedCompletion || !found ? 1 : 0),
+          totalSteps: found ? prev.totalSteps : prev.totalSteps + 1,
+          activeLabel: failed ? 'Agent is recovering from a tool error' : 'Tool step completed',
+          latestText: latest || prev.latestText,
+          error: failed ? latest || 'Tool step failed' : null,
+          tools: nextTools,
+        };
+      });
+      return;
+    }
+
+    if (eventType === 'message_chunk') {
+      if (typeof event.content === 'string' && event.content) {
+        finalTextRef.current = `${finalTextRef.current}${event.content}`.slice(-600);
+        const latest = compactText(finalTextRef.current, 180);
+        setProgress((prev) => ({
+          ...prev,
+          phase: prev.phase === 'idle' || prev.phase === 'waiting' ? 'running' : prev.phase,
+          activeLabel: 'Writing final response',
+          latestText: latest || prev.latestText,
+        }));
+      }
+      if (event.finish_reason === 'stop') {
+        setProgress((prev) => ({
+          ...prev,
+          statusText: 'Final response ready',
+          activeLabel: 'Final response ready',
+        }));
+      }
+      return;
+    }
+
+    if (eventType === 'artifact') {
+      setProgress((prev) => ({
+        ...prev,
+        phase: prev.phase === 'idle' || prev.phase === 'waiting' ? 'running' : prev.phase,
+        activeLabel: 'Generated an artifact',
+      }));
+      return;
+    }
+
+    if (eventType === 'finish') {
+      setProgress((prev) => ({
+        ...prev,
+        phase: 'completed',
+        statusText: 'Analysis complete',
+        completedSteps: Math.max(prev.completedSteps, prev.totalSteps),
+        activeLabel: null,
+        error: null,
+      }));
+      return;
+    }
+
+    if (eventType === 'error') {
+      const errorText = compactText(event.message || event.content || event.error) || 'Analysis failed';
+      setProgress((prev) => ({
+        ...prev,
+        phase: 'failed',
+        statusText: 'Analysis failed',
+        activeLabel: null,
+        error: errorText,
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!enabled || !threadId) {
+      setProgress(INITIAL_PROGRESS);
+      lastEventIdRef.current = null;
+      finalTextRef.current = '';
+      return;
+    }
+
+    let disposed = false;
+    const abort = new AbortController();
+
+    const run = async () => {
+      setProgress({
+        ...INITIAL_PROGRESS,
+        phase: 'waiting',
+        statusText: 'Starting analysis stream',
+      });
+
+      try {
+        let snapshot: WorkflowStatusSnapshot | null = null;
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          if (disposed || abort.signal.aborted) return;
+          snapshot = await getWorkflowStatus(threadId) as WorkflowStatusSnapshot;
+          if (disposed || abort.signal.aborted) return;
+          setProgress((prev) => updateFromStatus(prev, snapshot!));
+
+          const phase = phaseFromStatus(snapshot.status);
+          if (snapshot.can_reconnect || phase === 'running') break;
+          if (phase === 'completed' || phase === 'failed') return;
+          await sleep(attempt < 3 ? 800 : 1500);
+        }
+
+        if (disposed || abort.signal.aborted) return;
+        let runId = snapshot?.run_id || null;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          try {
+            await reconnectToWorkflowStream(
+              threadId,
+              runId,
+              lastEventIdRef.current,
+              handleEvent,
+              abort.signal,
+            );
+            break;
+          } catch (streamError) {
+            if (disposed || abort.signal.aborted) return;
+
+            const latestSnapshot = await getWorkflowStatus(threadId) as WorkflowStatusSnapshot;
+            if (disposed || abort.signal.aborted) return;
+            setProgress((prev) => updateFromStatus(prev, latestSnapshot));
+
+            const latestPhase = phaseFromStatus(latestSnapshot.status);
+            if (latestPhase === 'completed' || latestPhase === 'failed') return;
+            if (attempt === 3) throw streamError;
+
+            runId = latestSnapshot.run_id || runId;
+            setProgress((prev) => ({
+              ...prev,
+              phase: 'waiting',
+              statusText: 'Waiting for analysis stream',
+              activeLabel: 'Connecting to live progress',
+            }));
+            await sleep(900 + attempt * 600);
+          }
+        }
+      } catch (err) {
+        if (disposed || abort.signal.aborted) return;
+        const error = err instanceof Error ? err.message : 'Unable to stream progress';
+        setProgress((prev) => ({
+          ...prev,
+          phase: 'disconnected',
+          statusText: 'Live progress paused',
+          activeLabel: null,
+          error,
+        }));
+      } finally {
+        if (!disposed && !abort.signal.aborted) {
+          try {
+            const snapshot = await getWorkflowStatus(threadId) as WorkflowStatusSnapshot;
+            if (!disposed && !abort.signal.aborted) {
+              setProgress((prev) => {
+                const next = updateFromStatus(prev, snapshot);
+                if (next.phase === 'running') {
+                  return {
+                    ...next,
+                    phase: 'disconnected',
+                    statusText: 'Live progress paused',
+                    activeLabel: 'Open the analysis thread for the full stream',
+                  };
+                }
+                return next;
+              });
+            }
+          } catch {
+            // Keep the latest streamed state when the final status check fails.
+          }
+        }
+      }
+    };
+
+    void run();
+
+    return () => {
+      disposed = true;
+      abort.abort();
+    };
+  }, [enabled, handleEvent, threadId]);
+
+  return progress;
+}
+
 /**
  * PTCAgentCard - Inline HITL card for dispatching a PTC research agent.
  *
@@ -36,22 +475,39 @@ function PTCAgentCard({ proposalData, onApprove, onReject, flashContext }: PTCAg
   const [collapsed, setCollapsed] = useState(true);
   const [reportBack, setReportBack] = useState(proposalData?.report_back ?? true);
   const navigate = useNavigate();
+  const progress = usePtcProgress(
+    proposalData?.thread_id,
+    proposalData?.status === 'approved' && Boolean(proposalData?.thread_id),
+  );
 
   if (!proposalData) return null;
 
   const { workspace_name, question, status, thread_id, workspace_id } = proposalData;
   const isApproved = status === 'approved';
   const isRejected = status === 'rejected';
+  const progressPercent = progress.phase === 'completed'
+    ? 100
+    : progress.totalSteps <= 0
+      ? (progress.phase === 'running' ? 18 : 8)
+      : Math.max(8, Math.min(95, Math.round((progress.completedSteps / progress.totalSteps) * 100)));
+  const statusTone = progress.phase === 'failed'
+    ? 'var(--color-icon-danger)'
+    : progress.phase === 'completed'
+      ? 'var(--color-accent-light)'
+      : 'var(--color-text-tertiary)';
+  const StatusIcon = progress.phase === 'failed'
+    ? AlertCircle
+    : progress.phase === 'completed'
+      ? Check
+      : progress.phase === 'waiting'
+        ? Clock
+        : Activity;
 
   // --- Approved: clickable artifact to navigate to thread ---
   if (isApproved && thread_id && workspace_id) {
     return (
-      <motion.button
-        onClick={() => navigate(`/chat/t/${thread_id}`, { state: {
-          workspaceId: workspace_id,
-          ...(flashContext ? { fromThreadId: flashContext.threadId, fromWorkspaceId: flashContext.workspaceId } : {}),
-        } })}
-        className="flex items-center gap-3 w-full text-left rounded-lg px-4 py-3 cursor-pointer group transition-colors"
+      <motion.div
+        className="w-full rounded-lg px-4 py-3"
         style={{
           border: '1px solid var(--color-border-muted)',
           backgroundColor: 'var(--color-bg-secondary)',
@@ -59,25 +515,115 @@ function PTCAgentCard({ proposalData, onApprove, onReject, flashContext }: PTCAg
         whileHover={{ scale: 1.005 }}
         whileTap={{ scale: 0.995 }}
       >
-        <FlaskConical
-          className="h-4 w-4 flex-shrink-0"
-          style={{ color: 'var(--color-accent-light)' }}
-        />
-        <div className="flex-1 min-w-0">
-          {workspace_name && (
-            <div className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-              {workspace_name}
+        <div className="flex items-start gap-3">
+          <FlaskConical
+            className="h-4 w-4 flex-shrink-0 mt-0.5"
+            style={{ color: 'var(--color-accent-light)' }}
+          />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-start gap-2">
+              <div className="flex-1 min-w-0">
+                {workspace_name && (
+                  <div className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
+                    {workspace_name}
+                  </div>
+                )}
+                <div className="text-sm truncate" style={{ color: 'var(--color-text-tertiary)' }}>
+                  {question}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate(`/chat/t/${thread_id}`, { state: {
+                  workspaceId: workspace_id,
+                  ...(flashContext ? { fromThreadId: flashContext.threadId, fromWorkspaceId: flashContext.workspaceId } : {}),
+                } })}
+                className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors hover:brightness-110"
+                style={{
+                  border: '1px solid var(--color-border-muted)',
+                  color: 'var(--color-text-tertiary)',
+                }}
+              >
+                Open
+                <ExternalLink className="h-3 w-3" />
+              </button>
             </div>
-          )}
-          <div className="text-sm truncate" style={{ color: 'var(--color-text-tertiary)' }}>
-            {question}
+
+            <div className="mt-3">
+              <div className="flex items-center gap-2">
+                <StatusIcon
+                  className={`h-3.5 w-3.5 flex-shrink-0 ${progress.phase === 'running' ? 'animate-pulse' : ''}`}
+                  style={{ color: statusTone }}
+                />
+                <span className="text-xs font-medium" style={{ color: statusTone }}>
+                  {progress.statusText}
+                </span>
+                {progress.totalSteps > 0 && (
+                  <span className="text-xs ml-auto" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {progress.completedSteps}/{progress.totalSteps} steps
+                  </span>
+                )}
+              </div>
+              <div
+                className="mt-2 h-1.5 w-full overflow-hidden rounded-full"
+                style={{ backgroundColor: 'var(--color-border-muted)' }}
+              >
+                <motion.div
+                  className="h-full rounded-full"
+                  style={{ backgroundColor: progress.phase === 'failed' ? 'var(--color-icon-danger)' : 'var(--color-accent-light)' }}
+                  animate={{ width: `${progressPercent}%` }}
+                  transition={{ duration: 0.35, ease: 'easeOut' }}
+                />
+              </div>
+
+              {(progress.activeLabel || progress.latestText || progress.error) && (
+                <div className="mt-2 space-y-1">
+                  {progress.activeLabel && (
+                    <div className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                      <Wrench className="h-3 w-3 flex-shrink-0" />
+                      <span className="truncate">{progress.activeLabel}</span>
+                    </div>
+                  )}
+                  {progress.latestText && (
+                    <div className="text-xs leading-relaxed line-clamp-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                      {progress.latestText}
+                    </div>
+                  )}
+                  {progress.error && progress.phase !== 'completed' && (
+                    <div className="text-xs leading-relaxed" style={{ color: 'var(--color-icon-danger)' }}>
+                      {progress.error}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {progress.tools.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {progress.tools.map((tool) => (
+                    <span
+                      key={tool.id}
+                      className="inline-flex max-w-full items-center gap-1 rounded px-1.5 py-0.5 text-[11px]"
+                      style={{
+                        border: '1px solid var(--color-border-muted)',
+                        color: tool.status === 'failed' ? 'var(--color-icon-danger)' : 'var(--color-text-tertiary)',
+                      }}
+                    >
+                      {tool.status === 'running' ? (
+                        <Loader2 className="h-2.5 w-2.5 animate-spin flex-shrink-0" />
+                      ) : tool.status === 'completed' ? (
+                        <Check className="h-2.5 w-2.5 flex-shrink-0" />
+                      ) : (
+                        <X className="h-2.5 w-2.5 flex-shrink-0" />
+                      )}
+                      <span className="truncate">{tool.label}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
-        <ExternalLink
-          className="h-3.5 w-3.5 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
-          style={{ color: 'var(--color-text-tertiary)' }}
-        />
-      </motion.button>
+      </motion.div>
     );
   }
 
