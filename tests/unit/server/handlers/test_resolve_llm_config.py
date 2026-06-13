@@ -1405,3 +1405,431 @@ class TestStaleModelPreference:
         # Cache was invalidated once (pre-read), never a second time because
         # no write happened.
         assert mock_invalidate.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-user search provider selection + platform-tier gating
+# ---------------------------------------------------------------------------
+
+
+class TestSearchProviderPreference:
+    """The ``search_provider`` model preference selects the web-search engine.
+
+    OSS mode honours any valid engine; platform mode gates it behind
+    ``_fetch_platform_tier(user_id) >= SEARCH_PROVIDER_MIN_TIER``. An unknown
+    engine string is ignored (validity check runs before the tier gate, so the
+    membership fetch is skipped). When honoured, the returned config is a
+    copy-on-write copy with ``search_api`` set; when ignored, ``search_api``
+    stays the AgentConfig default ("tavily").
+    """
+
+    @pytest.mark.asyncio
+    async def test_oss_mode_honors_valid_provider(self, base_config, monkeypatch):
+        """OSS mode: a valid search_provider is honored without any tier check."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+        tier_mock = AsyncMock(return_value=0)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "serper"},
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "serper"
+        # OSS short-circuits before consulting membership.
+        tier_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_platform_mode_tier_at_min_honors_provider(self, base_config, monkeypatch):
+        """Platform mode: tier == min tier (1) → provider honored."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "serper"},
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "serper"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_platform_mode_tier_below_min_ignores_provider(self, base_config, monkeypatch):
+        """Platform mode: tier 0 (< min) → provider ignored, search_api stays default.
+
+        Asserts the gate consulted membership (``_fetch_platform_tier`` called)."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=0)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "serper"},
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        # Default AgentConfig.search_api is "tavily"; the pref was rejected.
+        assert config.search_api == "tavily"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_unknown_provider_ignored_without_tier_check(self, base_config, monkeypatch):
+        """An unknown engine string is rejected at the validity check, BEFORE the
+        tier gate — so platform membership is never fetched and nothing raises."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=2)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "duckduckgo"},
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        # Validity check fails first → search_api untouched, tier never consulted.
+        assert config.search_api == "tavily"
+        tier_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_platform_byok_user_honors_provider_via_tier(self, base_config, monkeypatch):
+        """Platform mode + is_byok=True: the tier still comes from
+        ``_fetch_platform_tier`` (not ChatAuthResult, which is -1 for BYOK
+        users), so a paid BYOK user (tier 1) still gets their provider."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        mock_byok_llm = MagicMock(name="byok-llm-client")
+        with (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "bocha"},
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch(
+                f"{HANDLER}.resolve_byok_llm_client",
+                new_callable=AsyncMock,
+                return_value=mock_byok_llm,
+            ),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, True)  # is_byok=True
+
+        assert config.search_api == "bocha"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_platform_mode_tier_negative_one_ignores_provider(self, base_config, monkeypatch):
+        """Platform mode: tier -1 (membership fetch failed / no access) → ignored,
+        no raise. The fallback path returns -1 < min tier, so the pref is dropped."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=-1)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "serper"},
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "tavily"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_no_search_provider_pref_leaves_config_untouched(self, base_config, monkeypatch):
+        """No ``search_provider`` pref at all → search_api unchanged and the
+        tier gate is never consulted (the whole block is skipped)."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=2)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(f"{HANDLER}.get_model_preference", new_callable=AsyncMock, return_value={}),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "tavily"
+        tier_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_string_provider_ignored_without_tier_check(self, base_config, monkeypatch):
+        """A non-string pref value (reachable via the untyped JSONB field) is
+        treated as invalid — ignored with no TypeError and no tier fetch."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=2)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": {"engine": "serper"}},
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "tavily"
+        tier_mock.assert_not_awaited()
+
+
+class TestSearchDepthPreference:
+    """The ``search_depth`` model preference selects a depth level of the
+    *effective* provider (post-provider-resolution). Levels and their tiers
+    come from the search manifest; entries without an explicit min_tier
+    resolve to the SEARCH_PROVIDER_MIN_TIER floor. Unknown / wrong-provider
+    levels are ignored before any tier fetch; the tier is fetched at most
+    once for the provider + depth pair.
+    """
+
+    def _patches(self, prefs):
+        mock_mc = _mock_model_config()
+        return (
+            patch(
+                f"{HANDLER}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value=prefs,
+            ),
+            patch(f"{HANDLER}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        )
+
+    @pytest.mark.asyncio
+    async def test_oss_mode_honors_depth_without_tier_check(self, base_config, monkeypatch):
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+        tier_mock = AsyncMock(return_value=0)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_depth": "deep"})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_depth == "deep"
+        tier_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_platform_tier_at_min_honors_depth(self, base_config, monkeypatch):
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_depth": "deep"})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_depth == "deep"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_platform_tier_below_min_ignores_depth(self, base_config, monkeypatch):
+        """Below-tier depth pref is dropped; config keeps the deployment
+        default ("standard")."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=0)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_depth": "deep"})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_depth == "standard"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_depth_not_on_effective_provider_ignored_without_tier_check(
+        self, base_config, monkeypatch
+    ):
+        """A level name the effective provider doesn't declare is rejected at
+        the membership check, BEFORE any tier fetch."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=2)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_depth": "warp9"})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_depth == "standard"
+        tier_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_depth_validated_against_resolved_provider(self, base_config, monkeypatch):
+        """Provider + depth combined: the provider pref is honored first, then
+        the depth is checked against THAT provider. 'deep' isn't a serper
+        level, so it degrades to the default while the provider sticks."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+        tier_mock = AsyncMock(return_value=5)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_provider": "serper", "search_depth": "deep"})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "serper"
+        assert config.search_depth == "standard"
+        tier_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provider_and_depth_share_a_single_tier_fetch(self, base_config, monkeypatch):
+        """Platform mode with both prefs set fetches the platform tier once."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=2)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_provider": "tavily", "search_depth": "deep"})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "tavily"
+        assert config.search_depth == "deep"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_provider_honored_while_depth_tier_gated(self, base_config, monkeypatch):
+        """Provider passes the tier gate but the depth requires a higher tier:
+        the provider sticks, the depth degrades to the provider default, and
+        the tier is still fetched only once."""
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        monkeypatch.setattr(
+            "src.tools.search_manifest.resolve_depth_tier", lambda depth: 2
+        )
+        tier_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_provider": "tavily", "search_depth": "deep"})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "tavily"
+        assert config.search_depth == "standard"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
+    async def test_non_string_depth_ignored_without_tier_check(self, base_config, monkeypatch):
+        from src.server.handlers.chat.llm_config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=2)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        p1, p2, p3 = self._patches({"search_depth": {"level": "deep"}})
+        with p1, p2, p3:
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_depth == "standard"
+        tier_mock.assert_not_awaited()

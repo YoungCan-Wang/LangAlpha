@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from ptc_agent.agent.middleware.background_subagent.event_capture import (
         SubagentEventCaptureMiddleware,
     )
+    from src.tools.decorators import ToolUsageTracker
 
 # This ContextVar propagates tool_call_id to subagent tool calls, used by
 # SubagentEventCaptureMiddleware to track which background task a tool call
@@ -87,6 +88,24 @@ def _truncate_description(description: str, max_sentences: int = 2) -> str:
     return " ".join(sentences)
 
 
+def _merge_subagent_usage(
+    task: BackgroundTask,
+    tracker: "PerCallTokenTracker",
+    tool_tracker: "ToolUsageTracker",
+) -> None:
+    """Merge this run's token + tool usage into any unpersisted usage on the task.
+
+    Resume re-runs a task before the collector may have persisted the prior
+    run; appending records and summing tool counts (instead of replacing) keeps
+    the prior run's usage until cleanup drops it after a successful persist.
+    """
+    task.per_call_records = (task.per_call_records or []) + (
+        tracker.per_call_records or []
+    )
+    for name, count in tool_tracker.get_summary().items():
+        task.tool_usage[name] = task.tool_usage.get(name, 0) + count
+
+
 async def _run_background_task(
     task: BackgroundTask,
     handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
@@ -98,8 +117,13 @@ async def _run_background_task(
 
     Shared by both the new-spawn and resume paths.
     """
+    from src.tools.decorators import ToolUsageTracker, set_tool_tracker
+
+    tool_tracker = ToolUsageTracker()
+
     async def run_handler() -> ToolMessage | Command:
         current_background_token_tracker.set(tracker)
+        set_tool_tracker(tool_tracker)
         return await handler(request)
 
     handler_task: asyncio.Task[ToolMessage | Command] = asyncio.create_task(
@@ -108,7 +132,7 @@ async def _run_background_task(
     task.handler_task = handler_task
     try:
         result = await asyncio.shield(handler_task)
-        task.per_call_records = tracker.per_call_records or []
+        _merge_subagent_usage(task, tracker, tool_tracker)
         logger.debug(
             "%s completed",
             label,
@@ -125,10 +149,10 @@ async def _run_background_task(
         )
         try:
             result = await handler_task
-            task.per_call_records = tracker.per_call_records or []
+            _merge_subagent_usage(task, tracker, tool_tracker)
             return {"success": True, "result": result}
         except Exception as e:
-            task.per_call_records = tracker.per_call_records or []
+            _merge_subagent_usage(task, tracker, tool_tracker)
             logger.error(
                 "%s failed after cancellation",
                 label,
@@ -137,7 +161,7 @@ async def _run_background_task(
             )
             return {"success": False, "error": str(e), "error_type": type(e).__name__}
     except Exception as e:
-        task.per_call_records = tracker.per_call_records or []
+        _merge_subagent_usage(task, tracker, tool_tracker)
         logger.error(
             "%s failed",
             label,
@@ -247,6 +271,10 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         task.result = None
         task.result_seen = False
         task.error = None
+        # tool_usage / per_call_records are intentionally NOT cleared here: if a
+        # collector hasn't billed the prior run yet, the next completion merges
+        # into them so run-1 usage survives the resume. Cleanup drops them only
+        # after a successful persist.
         task.captured_event_seq = 0
         task.captured_event_count = 0
         task.captured_event_bytes = 0

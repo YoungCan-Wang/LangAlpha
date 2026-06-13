@@ -822,7 +822,7 @@ async def resolve_llm_config(
     # Apply other model overrides from user preferences.
     # Both "compaction_model" (new) and "summarization_model" (legacy) map to
     # the renamed ``compaction`` config field; legacy key is read so existing
-    # rows in the platform-service DB keep working. Order matters: legacy is
+    # rows with the legacy key keep working. Order matters: legacy is
     # applied first so the new key wins when both are present.
     _other_model_keys = [
         ("summarization_model", "compaction"),
@@ -839,6 +839,75 @@ async def resolve_llm_config(
     if user_fallback is not None:
         _cow()
         config.llm.fallback = user_fallback
+
+    # Per-user search provider + depth, gated per the search manifest. This
+    # resolve-time check is the enforcement point, so a stale pref from a
+    # downgraded plan is ignored at consumption. ChatAuthResult.access_tier
+    # is -1 for BYOK/OAuth users, so the true tier is resolved here
+    # (Redis-cached) — once, lazily, shared by both checks.
+    pref_search_provider = model_pref.get("search_provider")
+    pref_search_depth = model_pref.get("search_depth")
+    if pref_search_provider or pref_search_depth:
+        from src.config.settings import HOST_MODE
+        from src.tools.search_manifest import (
+            get_search_provider_spec,
+            resolve_depth_tier,
+            resolve_provider_tier,
+        )
+
+        is_platform = HOST_MODE == "platform"
+        _user_tier: int | None = None
+
+        async def _platform_tier() -> int:
+            nonlocal _user_tier
+            if _user_tier is None:
+                from src.server.dependencies.usage_limits import _fetch_platform_tier
+
+                _user_tier = await _fetch_platform_tier(user_id)
+            return _user_tier
+
+        if pref_search_provider:
+            spec = (
+                get_search_provider_spec(pref_search_provider)
+                if isinstance(pref_search_provider, str)
+                else None
+            )
+            if spec is None:
+                logger.warning(
+                    f"[CHAT] Ignoring unknown search_provider preference: {pref_search_provider!r}"
+                )
+            elif not is_platform or await _platform_tier() >= resolve_provider_tier(spec):
+                _cow()
+                config.search_api = spec.name
+                logger.debug(f"[CHAT] Using search_provider: {spec.name}")
+            else:
+                logger.debug(
+                    f"[CHAT] search_provider pref ignored (tier below {resolve_provider_tier(spec)})"
+                )
+
+        if pref_search_depth:
+            # Depth names are provider-scoped: validate against the EFFECTIVE
+            # provider (post-provider-resolution), so a stale depth left over
+            # from another provider degrades to that provider's default.
+            eff_spec = get_search_provider_spec(config.search_api)
+            depth_spec = (
+                eff_spec.depth(pref_search_depth)
+                if eff_spec is not None and isinstance(pref_search_depth, str)
+                else None
+            )
+            if depth_spec is None:
+                logger.debug(
+                    f"[CHAT] search_depth pref {pref_search_depth!r} not offered by "
+                    f"provider {config.search_api!r}; using provider default"
+                )
+            elif not is_platform or await _platform_tier() >= resolve_depth_tier(depth_spec):
+                _cow()
+                config.search_depth = depth_spec.name
+                logger.debug(f"[CHAT] Using search_depth: {depth_spec.name}")
+            else:
+                logger.debug(
+                    f"[CHAT] search_depth pref ignored (tier below {resolve_depth_tier(depth_spec)})"
+                )
 
     # Compaction profile: a named preset (aggressive/moderate/extended/relaxed)
     # that bundles token_threshold, truncate_args_trigger_messages, and

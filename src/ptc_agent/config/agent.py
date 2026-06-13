@@ -234,6 +234,11 @@ class AgentConfig(BaseModel):
     # Search API provider (tavily, bocha, serper)
     search_api: str = "tavily"
 
+    # Search depth level name from the provider's manifest entry
+    # (src/tools/manifest/search_providers.json). Unknown levels fall back to
+    # the provider's default_depth.
+    search_depth: str = "standard"
+
     # Background task configuration
     # If True, wait for background tasks to complete before returning to CLI
     # If False (default), return immediately and show status of running tasks
@@ -536,7 +541,11 @@ class AgentConfig(BaseModel):
         core_config = CoreConfig(
             sandbox=self.sandbox,
             security=self.security,
-            mcp=self.mcp,
+            # Deep-copy the MCP config so each CoreConfig (hence each workspace
+            # sandbox) owns its MCPConfig. Sharing it by reference made every
+            # workspace's effective server set the same object — Phase 2 swaps
+            # in per-workspace servers, which must not bleed across workspaces.
+            mcp=self.mcp.model_copy(deep=True),
             logging=self.logging,
             filesystem=self.filesystem,
         )
