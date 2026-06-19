@@ -136,31 +136,30 @@ async def astream_flash_workflow(
         # =================================================================
         # Early steering routing
         # =================================================================
-        # If a workflow is already running (or soft-interrupted) for this
-        # thread, route this POST through the steering queue *before* any DB
-        # write. The persistence singleton's ``_turn_index_cache`` is shared
-        # across concurrent POSTs on the same thread, and
-        # ``qr_db.create_query`` uses ``ON CONFLICT (thread_id, turn_index)
-        # DO UPDATE``, so a second ``persist_query_start`` here would
-        # overwrite the running turn's query content with the steering text.
-        # Dispatched flow owns the BTM placeholder ``threads.py`` already
-        # reserved for it under the same ``(thread_id, run_id)`` key. We
-        # still must guarantee at most one in-flight LangGraph ``astream``
-        # per ``thread_id`` (the checkpointer is thread-keyed), so wait for
-        # any OTHER active run on the thread to settle. ``exclude_run_id``
-        # skips our own placeholder.
+        # If a workflow is already running for this thread, route this POST
+        # through the steering queue *before* any DB write. The persistence
+        # singleton's ``_turn_index_cache`` is shared across concurrent POSTs
+        # on the same thread, and ``qr_db.create_query`` uses ``ON CONFLICT
+        # (thread_id, turn_index) DO UPDATE``, so a second ``persist_query_start``
+        # here would overwrite the running turn's query content with the
+        # steering text. Dispatched flow owns the BTM placeholder ``threads.py``
+        # already reserved for it under the same ``(thread_id, run_id)`` key. We
+        # still must guarantee at most one in-flight LangGraph ``astream`` per
+        # ``thread_id`` (the checkpointer is thread-keyed), so admit only when
+        # no OTHER run is active on the thread. ``exclude_run_id`` skips our own
+        # placeholder; a running or still-stopping peer means 409.
         if dispatched:
-            settled = await manager.wait_for_soft_interrupted(
+            state = await manager.wait_for_admission(
                 thread_id, exclude_run_id=run_id
             )
-            if not settled:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Workflow {thread_id} is still running; dispatched "
-                        "follow-up could not be admitted."
-                    ),
+            if state != "fresh":
+                detail = (
+                    f"Workflow {thread_id} is stopping; retry shortly."
+                    if state == "stopping"
+                    else f"Workflow {thread_id} is still running; dispatched "
+                    "follow-up could not be admitted."
                 )
+                raise HTTPException(status_code=409, detail=detail)
             ready, steering_event = True, None
         else:
             ready, steering_event = await wait_or_steer(
