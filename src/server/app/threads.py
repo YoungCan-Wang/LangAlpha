@@ -50,6 +50,7 @@ from src.server.database.conversation import (
     delete_feedback,
     get_replay_thread_data,
 )
+from src.server.database.provenance import get_provenance_for_thread
 from psycopg_pool import PoolTimeout
 from src.server.dependencies.usage_limits import ChatRateLimited
 
@@ -594,11 +595,10 @@ async def _handle_send_message(
             from src.server.services.background_task_manager import BackgroundTaskManager
             manager = BackgroundTaskManager.get_instance()
             # Fail-fast admission at the HTTP boundary: if another run is
-            # still active on this thread, wait for it to settle (up to
-            # the soft-interrupt timeout). If it doesn't settle, return
-            # 409 here rather than dispatching a doomed background task.
+            # still active (running or stopping) on this thread, return 409
+            # here rather than dispatching a doomed background task.
             #
-            # The admission_lock is held across wait_for_soft_interrupted +
+            # The admission_lock is held across wait_for_admission +
             # pre_register so two concurrent dispatched POSTs on the same
             # thread can't both pass the gate and start workflows on the
             # same LangGraph thread_id (the foreground branch acquires
@@ -608,10 +608,10 @@ async def _handle_send_message(
             # schedules the background workflow.
             admission_lock = await manager.get_admission_lock(thread_id)
             async with admission_lock:
-                settled = await manager.wait_for_soft_interrupted(
+                state = await manager.wait_for_admission(
                     thread_id, exclude_run_id=run_id
                 )
-                if not settled:
+                if state != "fresh":
                     await release_burst_slot(user_id)
                     raise HTTPException(
                         status_code=409,
@@ -679,10 +679,10 @@ async def _handle_send_message(
         tracker = WorkflowTracker.get_instance()
         manager = BackgroundTaskManager.get_instance()
         # Fail-fast admission at the HTTP boundary: if another run is still
-        # active on this thread, wait for it to settle. If it doesn't,
-        # return 409 here rather than dispatching a doomed background task.
+        # active (running or stopping) on this thread, return 409 here rather
+        # than dispatching a doomed background task.
         #
-        # The admission_lock is held across wait_for_soft_interrupted +
+        # The admission_lock is held across wait_for_admission +
         # mark_active + pre_register so two concurrent dispatched POSTs on
         # the same thread can't both pass the gate and start workflows on
         # the same LangGraph thread_id (the foreground branch acquires
@@ -692,10 +692,10 @@ async def _handle_send_message(
         # the background workflow.
         admission_lock = await manager.get_admission_lock(thread_id)
         async with admission_lock:
-            settled = await manager.wait_for_soft_interrupted(
+            state = await manager.wait_for_admission(
                 thread_id, exclude_run_id=run_id
             )
-            if not settled:
+            if state != "fresh":
                 await release_burst_slot(user_id)
                 raise HTTPException(
                     status_code=409,
@@ -973,21 +973,20 @@ async def get_thread_status(thread_id: str, x_user_id: CurrentUserId):
 
 
 @router.post("/{thread_id}/cancel", status_code=200)
-async def cancel_thread(thread_id: str, x_user_id: CurrentUserId):
-    """Cancel a running workflow for this thread."""
+async def cancel_thread(
+    thread_id: str,
+    x_user_id: CurrentUserId,
+    run_id: Optional[str] = Query(None),
+):
+    """Cancel a running workflow for this thread.
+
+    ``run_id`` targets a specific run so a retried stop can't cancel a newer
+    turn started after the stopped one ended (defaults to latest active run).
+    """
     await require_thread_owner(thread_id, x_user_id)
     from src.server.handlers.workflow_handler import cancel_workflow
 
-    return await cancel_workflow(thread_id)
-
-
-@router.post("/{thread_id}/interrupt", status_code=200)
-async def interrupt_thread(thread_id: str, x_user_id: CurrentUserId):
-    """Soft interrupt — pause main agent, keep subagents running."""
-    await require_thread_owner(thread_id, x_user_id)
-    from src.server.handlers.workflow_handler import soft_interrupt_workflow
-
-    return await soft_interrupt_workflow(thread_id)
+    return await cancel_workflow(thread_id, run_id)
 
 
 @router.post("/{thread_id}/summarize", status_code=200)
@@ -1297,3 +1296,70 @@ async def remove_feedback(
     except Exception as e:
         logger.exception(f"Error deleting feedback for thread {thread_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete feedback")
+
+
+# =============================================================================
+# DATA PROVENANCE
+# =============================================================================
+
+
+@router.get("/{thread_id}/provenance")
+async def get_provenance(thread_id: str, x_user_id: CurrentUserId):
+    """Return the external data the agent accessed in a thread, grouped by turn.
+
+    The aggregated shape (per-turn sources + a by_source_type count summary) is
+    the structured input a post-hoc verification agent consumes.
+    """
+    try:
+        await require_thread_owner(thread_id, x_user_id)
+        rows = await get_provenance_for_thread(thread_id)
+
+        turns: dict[int, dict] = {}
+        by_source_type: dict[str, int] = {}
+        for row in rows:
+            turn_index = row["turn_index"]
+            turn = turns.get(turn_index)
+            if turn is None:
+                turn = {
+                    "turn_index": turn_index,
+                    "conversation_response_id": str(row["conversation_response_id"]),
+                    "sources": [],
+                }
+                turns[turn_index] = turn
+
+            source_timestamp = row.get("source_timestamp")
+            source = {
+                # `record_id` matches the SSE/replay provenance record field so a
+                # consumer can map streamed records to this REST shape directly.
+                "record_id": str(row["provenance_record_id"]),
+                "source_type": row["source_type"],
+                "identifier": row.get("identifier"),
+                "title": row.get("title"),
+                "detail": row.get("detail"),
+                "tool_call_id": row.get("tool_call_id"),
+                "args_fingerprint": row.get("args_fingerprint"),
+                "args": row.get("args"),
+                "result_sha256": row.get("result_sha256"),
+                "result_size": row.get("result_size"),
+                "result_snippet": row.get("result_snippet"),
+                "agent": row.get("agent"),
+                "provider": row.get("provider"),
+                "timestamp": (
+                    source_timestamp.isoformat() if source_timestamp else None
+                ),
+            }
+            turn["sources"].append(source)
+
+            source_type = row["source_type"]
+            by_source_type[source_type] = by_source_type.get(source_type, 0) + 1
+
+        return {
+            "thread_id": thread_id,
+            "turns": [turns[i] for i in sorted(turns)],
+            "by_source_type": by_source_type,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error getting provenance for thread {thread_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get provenance")

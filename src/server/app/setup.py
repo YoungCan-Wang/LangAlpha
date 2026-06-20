@@ -44,6 +44,7 @@ from src.config.settings import (
 from src.observability import init_otel, init_otel_runtime, shutdown_otel_runtime
 from src.server.services.background_task_manager import BackgroundTaskManager
 from src.server.services.background_registry_store import BackgroundRegistryStore
+from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-diag)
 
 # Phase 1: install fork-safe class-level instrumentor patches BEFORE FastAPI(...)
 # is constructed. FastAPIInstrumentor patches the FastAPI class — must run
@@ -72,9 +73,11 @@ llm_service = None  # Generic one-shot LLM call wrapper (BYOK/OAuth-aware)
 
 # PID 1 process names that correctly reap orphaned subprocesses.
 # `docker-init` is Docker's bundled tini wrapper (what `init: true` in compose
-# launches when no explicit entrypoint uses tini). Must be in the allowlist or
-# the reaper safety guard refuses to run in every standard Docker deployment.
-_ACCEPTABLE_INIT_COMMS = ("tini", "docker-init", "catatonit", "dumb-init")
+# launches when no explicit entrypoint uses tini); `podman-init` is the
+# equivalent shim rootless podman injects for `init: true` (catatonit under the
+# hood). Must be in the allowlist or this diagnostic logs a false "init: true
+# failed" warning on every startup of an otherwise-correctly-hardened container.
+_ACCEPTABLE_INIT_COMMS = ("tini", "docker-init", "catatonit", "dumb-init", "podman-init")
 
 
 def _log_container_hardening() -> None:
@@ -533,6 +536,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing usage limits HTTP client: {e}")
 
+    # 9.5. Close the PDF render browser singleton (headless Chromium), if one
+    # was launched to serve ?format=pdf. No-op when the pdf extra is unused.
+    try:
+        from src.server.services.pdf_render import close_browser
+
+        await close_browser()
+    except Exception as e:
+        logger.warning(f"Error closing PDF render browser: {e}")
+
     # 10. Flush + shut down OTel providers last, so spans/metrics emitted by
     # the earlier shutdown steps reach the collector before the daemon threads
     # exit. No-op when OTel is disabled. Run on a worker thread because
@@ -596,8 +608,66 @@ class RequestIDMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
+class MalformedIdDiagnosticMiddleware:
+    """TEMP (malformed-id-diag): log non-UUID workspace/thread ids with their Referer.
+
+    Pairs with the ``db_get_workspace`` UUID guard. When a file/dir name from the
+    SPA file tree reaches a workspace_id/thread_id slot the request now 404s
+    cleanly; this records the bad value, route, and Referer/User-Agent so the
+    next real prod occurrence names the SPA page that built it. Remove (with
+    ``find_malformed_route_ids``) once the frontend writer is identified.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("method") != "OPTIONS":
+            try:
+                findings = find_malformed_route_ids(
+                    scope.get("path", ""), scope.get("query_string", b"")
+                )
+                if findings:
+                    headers = {
+                        k.decode("latin-1").lower(): v.decode("latin-1")
+                        for k, v in scope.get("headers", [])
+                    }
+                    # %r on every user-controlled field so repr() escapes any
+                    # embedded CR/LF (the ASGI path is percent-decoded, so a
+                    # %0a in the URL would otherwise forge a log line); length
+                    # caps bound the log volume an attacker can spam.
+                    path = scope.get("path", "")[:512]
+                    referer = headers.get("referer", "")[:256]
+                    user_id = headers.get("x-user-id", "")[:128]
+                    ua = headers.get("user-agent", "")[:256]
+                    for slot, value in findings:
+                        logger.warning(
+                            "[malformed-id-diag] %s=%r path=%r "
+                            "referer=%r user_id=%r ua=%r",
+                            slot,
+                            value[:256],
+                            path,
+                            referer,
+                            user_id,
+                            ua,
+                        )
+            except Exception:  # noqa: BLE001 — diagnostics must never break a request
+                pass
+        await self.app(scope, receive, send)
+
+
 # Register GZip compression middleware (compresses JSON responses >= 1KB)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# TEMP (malformed-id-diag): log malformed workspace/thread ids + Referer so the next
+# real prod occurrence names the SPA route that built the bad request.
+# To remove (once the frontend writer is identified): delete this call, the
+# MalformedIdDiagnosticMiddleware class above, the setup.py import of
+# find_malformed_route_ids, then find_malformed_route_ids + its module
+# constants in src/server/utils/api.py and the test file
+# tests/unit/server/utils/test_malformed_route_ids.py. Every site is tagged
+# `malformed-id-diag` — `grep -rn malformed-id-diag src tests` lists them all.
+app.add_middleware(MalformedIdDiagnosticMiddleware)
 
 # Register request ID middleware (will be executed after CORS)
 # Note: In FastAPI, middleware is executed in reverse order (last added = first executed)
@@ -637,13 +707,13 @@ from src.server.app.cache import router as cache_router
 from src.server.app.utilities import health_router
 from src.server.app.workspaces import router as workspaces_router
 from src.server.app.workspace_files import router as workspace_files_router
+from src.server.app.workspace_files import wsfiles_router
 from src.server.app.workspace_sandbox import router as workspace_sandbox_router
 from src.server.app.workspace_sandbox import preview_redirect_router
 from src.server.app.market_data import router as market_data_router
 from src.server.app.users import router as users_router
 from src.server.app.watchlist import router as watchlist_router
 from src.server.app.portfolio import router as portfolio_router
-from src.server.app.infoflow import router as infoflow_router
 from src.server.app.news import router as news_router
 from src.server.app.calendar import router as calendar_router
 from src.server.app.sec_proxy import router as sec_proxy_router
@@ -698,9 +768,6 @@ app.include_router(
 app.include_router(
     portfolio_router
 )  # /api/v1/users/me/portfolio/* - Portfolio management
-app.include_router(
-    infoflow_router
-)  # /api/v1/infoflow/* - InfoFlow content feed (kept for PopularCard)
 app.include_router(news_router)  # /api/v1/news - News feed (general + ticker-filtered)
 app.include_router(calendar_router)  # /api/v1/calendar/* - Economic & earnings calendars
 app.include_router(sec_proxy_router)  # /api/v1/sec-proxy/* - SEC EDGAR document proxy
@@ -735,6 +802,9 @@ app.include_router(health_router)  # /health - Health check
 app.include_router(
     preview_redirect_router
 )  # /api/v1/preview/{workspace_id}/{port} - Unauthenticated preview URL redirect
+app.include_router(
+    wsfiles_router
+)  # /api/v1/wsfiles/{workspace_id}/{path} - Unauthenticated path-style file serving
 
 app.include_router(
     market_data_ws_router

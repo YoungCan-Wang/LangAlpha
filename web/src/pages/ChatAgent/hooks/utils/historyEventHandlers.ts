@@ -4,7 +4,10 @@
  */
 
 import { normalizeAction } from './eventUtils';
+import { provenanceEventToRecord, provenanceRecordKey } from './streamEventHandlers';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from './types';
+import type { ProvenanceEvent } from '@/types/sse';
+import type { ProvenanceRecord } from '@/types/chat';
 
 let _steeringIdCounter = 0;
 
@@ -350,10 +353,14 @@ export function handleHistoryTextContent({ assistantMessageId, content, finishRe
     );
     return true;
   } else if (finishReason) {
+    // A stopped turn persists a synthetic finish_reason:"stopped" — stamp the
+    // message so the per-message "⏹ Stopped" chip renders on reload, matching
+    // the live finalize. Any other finish_reason just closes the message.
+    const isStopped = finishReason === 'stopped';
     setMessages((prev: MessageRecord[]) =>
       prev.map((msg: MessageRecord) =>
         msg.id === assistantMessageId
-          ? { ...msg, isStreaming: false }
+          ? { ...msg, isStreaming: false, ...(isStopped ? { stopped: true } : {}) }
           : msg
       )
     );
@@ -537,6 +544,41 @@ export function handleHistoryToolCallResult({ assistantMessageId, toolCallId, re
         toolCallProcesses,
         subagentTasks,
       };
+    })
+  );
+
+  return true;
+}
+
+/**
+ * Handles provenance events in history replay. Re-attaches the accessed-data
+ * record to the assistant message resolved from the replay `turn_index` (the
+ * caller maps `turn_index` → `assistantMessageId`). Keyed by
+ * `provenanceRecordKey` so multiple web_search URLs sharing one `tool_call_id`
+ * are all kept on reload.
+ */
+export function handleHistoryProvenance({ assistantMessageId, event, setMessages }: {
+  assistantMessageId: string;
+  event: ProvenanceEvent;
+  setMessages: SetMessages;
+}): boolean {
+  if (!event || !event.record_id) {
+    return false;
+  }
+
+  const record = provenanceEventToRecord(event);
+  const key = provenanceRecordKey(record);
+
+  setMessages((prev: MessageRecord[]) =>
+    prev.map((msg: MessageRecord) => {
+      if (msg.id !== assistantMessageId) return msg;
+
+      const provenanceRecords = {
+        ...((msg.provenanceRecords as Record<string, ProvenanceRecord>) || {}),
+        [key]: record,
+      };
+
+      return { ...msg, provenanceRecords };
     })
   );
 

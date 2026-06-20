@@ -16,7 +16,7 @@ from psycopg.types.json import Json
 from psycopg_pool import AsyncConnectionPool
 
 from src.config.settings import get_conversation_pool_max
-from src.server.utils.pg_sanitize import SafeJson, strip_pg_nul_str
+from src.server.utils.pg_sanitize import SafeJson, normalize_uuid, strip_pg_nul_str
 
 logger = logging.getLogger(__name__)
 
@@ -1090,6 +1090,46 @@ async def get_queries_for_thread(
 # ==================== Response Operations ====================
 
 
+def _sse_has_provenance(sse_events: Optional[Any]) -> bool:
+    """True if any accumulated SSE event is a provenance entry."""
+    if not sse_events:
+        return False
+    return any(
+        isinstance(e, dict) and e.get("event") == "provenance" for e in sse_events
+    )
+
+
+async def _sync_provenance_for_response(
+    conn,
+    *,
+    conversation_response_id: str,
+    conversation_thread_id: str,
+    turn_index: int,
+    sse_events: Optional[Any],
+) -> None:
+    """(Re)derive provenance_records from sse_events on the caller's connection.
+
+    Imported lazily to avoid a circular import (provenance imports this module).
+    Best-effort — the helper itself never raises.
+    """
+    # Most persists carry no provenance (a turn with no external data access, or
+    # a non-provenance event drain). Skip the extract + delete-then-insert when
+    # there's no provenance entry: nothing to (re)write, and within a turn events
+    # only accumulate, so "none now" means "none ever" for this response.
+    if not _sse_has_provenance(sse_events):
+        return
+
+    from src.server.database.provenance import sync_provenance_for_response
+
+    await sync_provenance_for_response(
+        conn,
+        conversation_response_id=conversation_response_id,
+        conversation_thread_id=conversation_thread_id,
+        turn_index=turn_index,
+        sse_events=sse_events,
+    )
+
+
 async def create_response(
     conversation_response_id: str,
     conversation_thread_id: str,
@@ -1203,6 +1243,21 @@ async def create_response(
                 logger.debug(
                     f"[conversation_db] create_response response_id={conversation_response_id} thread_id={conversation_thread_id} turn_index={turn_index} status={status}"
                 )
+                # Use the canonical row id from RETURNING — on ON CONFLICT this
+                # is the EXISTING row's id, which may differ from the arg. The
+                # provenance FK must reference the row that actually persisted.
+                canonical_response_id = (
+                    str(result["conversation_response_id"])
+                    if result
+                    else conversation_response_id
+                )
+                await _sync_provenance_for_response(
+                    conn,
+                    conversation_response_id=canonical_response_id,
+                    conversation_thread_id=conversation_thread_id,
+                    turn_index=turn_index,
+                    sse_events=sse_events,
+                )
                 return dict(result)
         else:
             # Acquire new connection (backward compatibility)
@@ -1281,6 +1336,19 @@ async def create_response(
                     logger.debug(
                         f"[conversation_db] create_response response_id={conversation_response_id} thread_id={conversation_thread_id} turn_index={turn_index} status={status}"
                     )
+                    # Canonical id from RETURNING (see conn-branch note above).
+                    canonical_response_id = (
+                        str(result["conversation_response_id"])
+                        if result
+                        else conversation_response_id
+                    )
+                    await _sync_provenance_for_response(
+                        conn,
+                        conversation_response_id=canonical_response_id,
+                        conversation_thread_id=conversation_thread_id,
+                        turn_index=turn_index,
+                        sse_events=sse_events,
+                    )
                     return dict(result)
 
     except Exception as e:
@@ -1309,28 +1377,52 @@ async def update_sse_events(
     """
     try:
         if conn:
-            async with conn.cursor() as cur:
+            async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
                     UPDATE conversation_responses
                     SET sse_events = %s
                     WHERE conversation_response_id = %s
+                    RETURNING conversation_thread_id, turn_index
                     """,
                     (SafeJson(sse_events), conversation_response_id),
                 )
-                updated = cur.rowcount > 0
+                row = await cur.fetchone()
+                updated = row is not None
+            if updated:
+                # Re-derive provenance_records on the same connection. This is
+                # the choke point for the background subagent drain and the
+                # context_window append, neither of which goes through
+                # create_response.
+                await _sync_provenance_for_response(
+                    conn,
+                    conversation_response_id=conversation_response_id,
+                    conversation_thread_id=str(row["conversation_thread_id"]),
+                    turn_index=row["turn_index"],
+                    sse_events=sse_events,
+                )
         else:
             async with get_db_connection() as conn:
-                async with conn.cursor() as cur:
+                async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         """
                         UPDATE conversation_responses
                         SET sse_events = %s
                         WHERE conversation_response_id = %s
+                        RETURNING conversation_thread_id, turn_index
                         """,
                         (SafeJson(sse_events), conversation_response_id),
                     )
-                    updated = cur.rowcount > 0
+                    row = await cur.fetchone()
+                    updated = row is not None
+                if updated:
+                    await _sync_provenance_for_response(
+                        conn,
+                        conversation_response_id=conversation_response_id,
+                        conversation_thread_id=str(row["conversation_thread_id"]),
+                        turn_index=row["turn_index"],
+                        sse_events=sse_events,
+                    )
 
         if updated:
             logger.info(
@@ -1345,6 +1437,49 @@ async def update_sse_events(
 
     except Exception as e:
         logger.error(f"Error updating sse_events: {e}")
+        raise
+
+
+async def append_sse_event(
+    conversation_thread_id: str,
+    event: Dict[str, Any],
+    conn=None,
+) -> bool:
+    """Atomically append one SSE event to the thread's latest response blob.
+
+    A server-side ``sse_events || event`` JSONB concat scoped to the most-recent
+    response (by turn_index). Avoids reading the whole blob into Python and
+    rewriting it, and is race-free against concurrent appenders (the
+    read-modify-write it replaces is not). Returns True when a row was updated,
+    False when the thread has no response row yet.
+    """
+    sql = """
+        UPDATE conversation_responses
+        SET sse_events = COALESCE(sse_events, '[]'::jsonb) || %s::jsonb
+        WHERE conversation_response_id = (
+            SELECT conversation_response_id
+            FROM conversation_responses
+            WHERE conversation_thread_id = %s
+            ORDER BY turn_index DESC
+            LIMIT 1
+        )
+    """
+    params = (SafeJson([event]), conversation_thread_id)
+    try:
+        if conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                updated = cur.rowcount > 0
+        else:
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(sql, params)
+                    updated = cur.rowcount > 0
+
+        return updated
+
+    except Exception as e:
+        logger.error(f"Error appending sse_event: {e}")
         raise
 
 
@@ -1690,6 +1825,14 @@ async def get_thread_by_id(conversation_thread_id: str) -> Optional[Dict[str, An
 
 async def get_thread_owner_id(thread_id: str) -> Optional[str]:
     """Return the user_id that owns the thread's workspace, or None if not found."""
+    # Normalize before querying: postgres' uuid type rejects forms uuid.UUID()
+    # accepts (e.g. urn:uuid:...), so binding the raw value risks
+    # InvalidTextRepresentation (22P02) → 500. A non-UUID thread_id (e.g. a
+    # file/dir name from the SPA tree) can't match the column; treat it as
+    # not-found so require_thread_owner returns a clean 404.
+    thread_id = normalize_uuid(thread_id)
+    if thread_id is None:
+        return None
     try:
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:

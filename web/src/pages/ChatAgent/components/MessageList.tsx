@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Bot, User, FileText, ImageIcon, Pencil, RefreshCw, RotateCcw, Copy, Check, Info, ThumbsUp, ThumbsDown } from 'lucide-react';
+import { Bot, User, FileText, FileSearch, ImageIcon, Pencil, RefreshCw, RotateCcw, Copy, Check, Info, ThumbsUp, ThumbsDown, StopCircle } from 'lucide-react';
 import { type WidgetContextPreviewShape } from '@/pages/Dashboard/widgets/framework/WidgetContextPreview';
 import { WidgetContextDeck } from '@/pages/Dashboard/widgets/framework/WidgetContextDeck';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -38,6 +38,7 @@ import TextMessageContent from './TextMessageContent';
 import InlineWidget from './viewers/InlineWidget';
 import ToolCallMessageContent from './ToolCallMessageContent';
 import { CitationMetadataProvider } from './CitationMetadataContext';
+import { countDedupedSources, type ProvenanceRecord } from '@/types/chat';
 
 import { TextShimmer } from '@/components/ui/text-shimmer';
 
@@ -327,6 +328,7 @@ interface MessageListProps {
   allowFiles?: boolean;
   onOpenSubagentTask?: (info: SubagentInfo) => void;
   onOpenFile?: (filePath: string, workspaceId?: string) => void;
+  onOpenSources?: (messageId: string) => void;
   onOpenDir?: (dirPath: string) => void;
   onToolCallDetailClick?: (proc: ToolCallProcessRecord) => void;
   onApprovePlan?: () => void;
@@ -353,7 +355,7 @@ interface MessageListProps {
   flashContext?: { threadId: string; workspaceId: string } | null;
 }
 
-function MessageList({ messages, isLoading, isLoadingHistory, hideAvatar, compactToolCalls, isSubagentView, readOnly, allowFiles, onOpenSubagentTask, onOpenFile, onOpenDir, onToolCallDetailClick, onApprovePlan, onRejectPlan, onPlanDetailClick, onAnswerQuestion, onSkipQuestion, onApproveCreateWorkspace, onRejectCreateWorkspace, onApproveStartQuestion, onRejectStartQuestion, onApprovePTCAgent, onRejectPTCAgent, onApproveSecretaryAction, onRejectSecretaryAction, onEditMessage, onRegenerate, onRetry, onThumbUp, onThumbDown, getFeedbackForMessage, onReportWithAgent, onWidgetSendPrompt, flashContext }: MessageListProps): React.ReactElement | null {
+function MessageList({ messages, isLoading, isLoadingHistory, hideAvatar, compactToolCalls, isSubagentView, readOnly, allowFiles, onOpenSubagentTask, onOpenFile, onOpenSources, onOpenDir, onToolCallDetailClick, onApprovePlan, onRejectPlan, onPlanDetailClick, onAnswerQuestion, onSkipQuestion, onApproveCreateWorkspace, onRejectCreateWorkspace, onApproveStartQuestion, onRejectStartQuestion, onApprovePTCAgent, onRejectPTCAgent, onApproveSecretaryAction, onRejectSecretaryAction, onEditMessage, onRegenerate, onRetry, onThumbUp, onThumbDown, getFeedbackForMessage, onReportWithAgent, onWidgetSendPrompt, flashContext }: MessageListProps): React.ReactElement | null {
   const isMobile = useIsMobile();
 
   // Empty state - show when no messages exist (hidden in subagent view)
@@ -419,6 +421,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, hideAvatar, compac
             isMobile={isMobile}
             onOpenSubagentTask={onOpenSubagentTask}
             onOpenFile={onOpenFile}
+            onOpenSources={onOpenSources}
             onOpenDir={onOpenDir}
             onToolCallDetailClick={onToolCallDetailClick}
             onApprovePlan={onApprovePlan}
@@ -462,6 +465,7 @@ interface MessageBubbleProps {
   allowFiles?: boolean;
   onOpenSubagentTask?: (info: SubagentInfo) => void;
   onOpenFile?: (filePath: string, workspaceId?: string) => void;
+  onOpenSources?: (messageId: string) => void;
   onOpenDir?: (dirPath: string) => void;
   onToolCallDetailClick?: (proc: ToolCallProcessRecord) => void;
   onApprovePlan?: () => void;
@@ -493,7 +497,8 @@ interface MessageBubbleProps {
  * Wrapped with React.memo — safe because updateMessage() in messageHelpers.ts
  * returns the same object reference for unchanged messages.
  */
-const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvatar, compactToolCalls, isSubagentView, readOnly, allowFiles, onOpenSubagentTask, onOpenFile, onOpenDir, onToolCallDetailClick, onApprovePlan, onRejectPlan, onPlanDetailClick, onAnswerQuestion, onSkipQuestion, onApproveCreateWorkspace, onRejectCreateWorkspace, onApproveStartQuestion, onRejectStartQuestion, onApprovePTCAgent, onRejectPTCAgent, onApproveSecretaryAction, onRejectSecretaryAction, onEditMessage, onRegenerate, onRetry, onThumbUp, onThumbDown, getFeedbackForMessage, onReportWithAgent, onWidgetSendPrompt, isMobile, flashContext }: MessageBubbleProps): React.ReactElement {
+const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvatar, compactToolCalls, isSubagentView, readOnly, allowFiles, onOpenSubagentTask, onOpenFile, onOpenSources, onOpenDir, onToolCallDetailClick, onApprovePlan, onRejectPlan, onPlanDetailClick, onAnswerQuestion, onSkipQuestion, onApproveCreateWorkspace, onRejectCreateWorkspace, onApproveStartQuestion, onRejectStartQuestion, onApprovePTCAgent, onRejectPTCAgent, onApproveSecretaryAction, onRejectSecretaryAction, onEditMessage, onRegenerate, onRetry, onThumbUp, onThumbDown, getFeedbackForMessage, onReportWithAgent, onWidgetSendPrompt, isMobile, flashContext }: MessageBubbleProps): React.ReactElement {
+  const { t } = useTranslation();
   const { user } = useUser();
   const { theme } = useTheme();
   const logo = theme === 'light' ? logoDark : logoLight;
@@ -550,6 +555,16 @@ const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvat
   // ~32px layout jump on sibling messages when streaming ends.
   const canShowActions = !isSubagentView && !readOnly;
   const showActions = canShowActions && !(message.isStreaming as boolean) && !isLoading;
+
+  // Provenance count for the Sources pill, deduped by (source_type, identifier)
+  // — the same URL fetched twice in one turn counts once. The pill lives in its
+  // own always-visible row (not the hover-gated footer), so it shows mid-stream.
+  // Shares countDedupedSources with SourcesPanel so the pill and panel counts
+  // can never silently diverge.
+  const sourceCount = useMemo(() => {
+    if (!isAssistant || isSubagentView) return 0;
+    return countDedupedSources(message.provenanceRecords as Record<string, ProvenanceRecord> | undefined);
+  }, [message.provenanceRecords, isAssistant, isSubagentView]);
 
   const resizeTextarea = () => {
     const el = editTextareaRef.current;
@@ -782,6 +797,39 @@ const MessageBubble = memo(function MessageBubble({ message, isLoading, hideAvat
           })()}
         </div>
 
+        {/* Sources pill -- always-visible row (not the hover-gated footer below,
+            which is hidden during streaming). Surfaces the turn's tracked data
+            provenance; clicking opens the Sources tab in the right panel. */}
+        {isAssistant && !isSubagentView && sourceCount > 0 && (
+          <div className="flex justify-start mt-1">
+            <button
+              type="button"
+              onClick={() => onOpenSources?.(message.id as string)}
+              className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors"
+              style={{
+                backgroundColor: 'var(--color-bg-elevated)',
+                color: 'var(--color-text-secondary)',
+              }}
+              title={t('chat.sources.title')}
+            >
+              <FileSearch className="h-3.5 w-3.5" />
+              {t('chat.sources.pill', { count: sourceCount })}
+            </button>
+          </div>
+        )}
+
+        {/* Per-message "⏹ Stopped" chip — the turn was hard-stopped by the
+            user (live finalize or replay of a stopped turn). */}
+        {isAssistant && (message.stopped as boolean) && (
+          <div
+            className="inline-flex items-center gap-1 self-start px-2 py-0.5 rounded text-xs"
+            style={{ backgroundColor: 'var(--color-loss-soft)', color: 'var(--color-loss)' }}
+          >
+            <StopCircle className="h-3 w-3 flex-shrink-0" />
+            <span>{t('chat.stoppedChip')}</span>
+          </div>
+        )}
+
         {/* Attachment preview cards -- standalone below the bubble */}
         {hasAttachments && (
           <div className="flex gap-3 overflow-x-auto">
@@ -966,8 +1014,8 @@ interface MessageContentSegmentsProps {
   flashContext?: { threadId: string; workspaceId: string } | null;
 }
 
-const MIN_LIVE_EXPOSURE_MS = 5000; // minimum time an item stays in the live zone
-const MAX_IN_PROGRESS_MS = 15000; // max time a tool call can stay in-progress in live view before archiving
+const MIN_LIVE_EXPOSURE_MS = 1800; // minimum time a just-completed item stays in the live zone before folding
+const MAX_IN_PROGRESS_MS = 15000; // max time a tool call can stay in-progress in live view before archiving (independent of MIN_LIVE_EXPOSURE_MS)
 /** Tools that should stay in the live zone for their entire duration (no MAX_IN_PROGRESS_MS cap) */
 const ALWAYS_LIVE_TOOLS = new Set(['TaskOutput', 'WebFetch']);
 /** Tool calls that are never rendered as visible activity items — they have dedicated UI or are internal */
@@ -1080,7 +1128,7 @@ function TextBlock({ block, isFirst, isStreaming, hasError, structuredError, isS
   return isFirst && textContent ? <div className="-mt-1">{textEl}</div> : textEl;
 }
 
-const MessageContentSegments = memo(function MessageContentSegments({ segments, reasoningProcesses, toolCallProcesses, todoListProcesses, subagentTasks, planApprovals = EMPTY_OBJ, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, hasError, structuredError, isAssistant = false, compactToolCalls = false, isSubagentView = false, readOnly = false, allowFiles = false, onOpenSubagentTask, onOpenFile, onOpenDir, onToolCallDetailClick, onApprovePlan, onRejectPlan, onPlanDetailClick, onAnswerQuestion, onSkipQuestion, onApproveCreateWorkspace, onRejectCreateWorkspace, onApproveStartQuestion, onRejectStartQuestion, onApprovePTCAgent, onRejectPTCAgent, onApproveSecretaryAction, onRejectSecretaryAction, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, onWidgetSendPrompt, htmlWidgetProcesses = EMPTY_OBJ, textOnly = false, flashContext }: MessageContentSegmentsProps): React.ReactElement {
+const MessageContentSegments = memo(function MessageContentSegments({ segments, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, planApprovals = EMPTY_OBJ, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, hasError, structuredError, isAssistant = false, compactToolCalls = false, isSubagentView = false, readOnly = false, allowFiles = false, onOpenSubagentTask, onOpenFile, onOpenDir, onToolCallDetailClick, onApprovePlan, onRejectPlan, onPlanDetailClick, onAnswerQuestion, onSkipQuestion, onApproveCreateWorkspace, onRejectCreateWorkspace, onApproveStartQuestion, onRejectStartQuestion, onApprovePTCAgent, onRejectPTCAgent, onApproveSecretaryAction, onRejectSecretaryAction, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, onWidgetSendPrompt, htmlWidgetProcesses = EMPTY_OBJ, textOnly = false, flashContext }: MessageContentSegmentsProps): React.ReactElement {
   // Force re-render timer for recently-completed tool calls that need minimum exposure
   const [tick, setTick] = useState(0);
   const expiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1172,6 +1220,13 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
       let computedNextExpiry: number | null = null;
 
       const now = Date.now();
+      // Stream end folds just-COMPLETED items into the accordion immediately
+      // instead of waiting out the cooldown. It does NOT evict in-progress work:
+      // always-live tools (TaskOutput) are kept live by the active branch below
+      // regardless of isStreaming, so a running subagent stays visible after the
+      // main stream ends. History/replay items (isStreaming always false) land
+      // directly in the accordion regardless of timestamps.
+      const streamEnded = !isStreaming;
 
       const flushActivity = () => {
         if (pendingItems.length > 0) {
@@ -1203,7 +1258,7 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
             const completedAt = proc._completedAt as number | undefined;
             const completedAge = completedAt ? now - completedAt : Infinity;
 
-            if (completedAge < MIN_LIVE_EXPOSURE_MS) {
+            if (!streamEnded && completedAge < MIN_LIVE_EXPOSURE_MS) {
               pendingItems.push({
                 type: 'reasoning',
                 id: seg.reasoningId,
@@ -1239,7 +1294,14 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
 
           const isAlwaysLive = ALWAYS_LIVE_TOOLS.has(proc.toolName as string);
 
-          if ((proc.isInProgress as boolean) && isStreaming && (isAlwaysLive || age < MAX_IN_PROGRESS_MS)) {
+          // Always-live tools (TaskOutput / WebFetch) stay pinned in the live zone
+          // for their entire in-progress duration — including after the main stream
+          // ends (isStreaming false) while a background subagent keeps running, so
+          // the "waiting on a subagent" indicator never disappears. Safe on history/
+          // replay: reconstructed tool calls are always isInProgress=false, so this
+          // branch can't fire there. Regular in-progress tools still require a live
+          // stream and fold once age passes MAX_IN_PROGRESS_MS.
+          if ((proc.isInProgress as boolean) && (isAlwaysLive || (isStreaming && age < MAX_IN_PROGRESS_MS))) {
             pendingItems.push({
               type: 'tool_call',
               id: seg.toolCallId,
@@ -1261,7 +1323,7 @@ const MessageContentSegments = memo(function MessageContentSegments({ segments, 
               toolCallId: seg.toolCallId!,
               proc,
             });
-          } else if (age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {
+          } else if (!streamEnded && age < MIN_LIVE_EXPOSURE_MS && !INLINE_ARTIFACT_TOOLS.has(proc.toolName as string)) {
             pendingItems.push({
               type: 'tool_call',
               id: seg.toolCallId,

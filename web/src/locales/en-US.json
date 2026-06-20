@@ -47,6 +47,19 @@
   "account": {
     "menuLabel": "Account menu"
   },
+  "nav": {
+    "pin": "Pin panel",
+    "unpin": "Unpin panel",
+    "minimize": "Minimize panel",
+    "displayOptions": "Display options",
+    "newThread": "New thread",
+    "orderBy": "Order by",
+    "workspacesShown": "Workspaces shown",
+    "threadsPerWorkspace": "Threads per workspace",
+    "all": "All",
+    "showMore": "Show more",
+    "loadAll": "Load all"
+  },
   "settings": {
     "title": "User Settings",
     "userInfo": "User Info",
@@ -55,6 +68,7 @@
     "theme": "Theme",
     "dark": "Dark",
     "light": "Light",
+    "auto": "Auto",
     "locale": "Language",
     "voiceInput": "Voice Input",
     "voiceInputDesc": "Enable microphone icon in the chat bar for speech-to-text.",
@@ -78,6 +92,11 @@
     "riskTolerance": "Risk Tolerance",
     "investmentStyle": "Investment Style",
     "agentSettings": "Agent Settings",
+    "outputFormat": "Output format",
+    "outputFormatDefault": "Default",
+    "outputFormatHtml": "HTML",
+    "outputFormatDescriptionDefault": "Answers come back as clean, easy-to-read text — the standard format.",
+    "outputFormatDescriptionHtml": "In-depth answers come back as a polished visual report — with charts, tables, and interactive views you can explore — instead of plain text. It's easier to read and more engaging, but takes a little longer to prepare and uses more credits.",
     "resetPreferences": "Reset Preferences",
     "resetConfirmMsg": "This will clear all your preferences (risk tolerance, investment style, agent settings). You can set them up again anytime via the agent. Are you sure?",
     "resetting": "Resetting...",
@@ -982,9 +1001,6 @@
       "emptyWatchlist": "Add stocks to your watchlist to see relevant news here",
       "emptyDefault": "No news available"
     },
-    "popularCard": {
-      "title": "What's Popular"
-    },
     "topNews": {
       "title": "Top News",
       "sample1": "Retail Sales Slump Takes Toll on Market,...",
@@ -1015,6 +1031,8 @@
     "dragToReorder": "Drag to reorder",
     "pinToTop": "Pin to top",
     "unpin": "Unpin",
+    "rename": "Rename",
+    "options": "Options",
     "noWorkspacesFound": "No workspaces found",
     "welcomeTitle": "Welcome to LangAlpha",
     "welcomeDesc": "Get started by setting up your preferences or creating a workspace.",
@@ -1094,7 +1112,8 @@
     "worker": "Worker",
     "agentNotFound": "Agent not found",
     "planFeedbackHint": "Type your feedback to revise the plan, then send.",
-    "interruptedHint": "Agent interrupted. Feel free to provide new instructions.",
+    "stoppedChip": "Stopped",
+    "stopFailed": "Couldn't stop the run — it may still be running.",
     "errorUpstreamHeadline": "The model provider returned an error",
     "errorUpstreamHeadlineStatus": "The model provider returned an error ({{status}})",
     "errorInternalHeadline": "Something went wrong on our end",
@@ -1128,7 +1147,7 @@
     "offloading": "Offloading context...",
     "placeholderDefault": "Type / for skills, @ for files",
     "placeholderPendingRejection": "Describe how to revise the plan...",
-    "placeholderInterrupted": "Send new instructions to the agent...",
+    "placeholderStopped": "Stopped — send a message to continue",
     "placeholderLoading": "Type a follow-up to steer the agent...",
     "placeholderSubagentsRunning": "Workers still running. Send a message or click a worker to instruct it.",
     "slashCommand": {
@@ -1185,6 +1204,52 @@
       "permissionDenied": "Microphone permission denied",
       "serviceError": "Speech recognition service error"
     },
+    "sources": {
+      "title": "Sources",
+      "pill_one": "Sources ({{count}})",
+      "pill_other": "Sources ({{count}})",
+      "empty": "No sources for this turn",
+      "groups": {
+        "web_search": "Web search",
+        "web_fetch": "Web pages",
+        "file_read": "Files",
+        "memo_read": "Memos",
+        "memory_read": "Memory",
+        "sec_filing": "SEC filings",
+        "market_data": "Market data",
+        "mcp_tool": "Financial data tools"
+      },
+      "fingerprint": {
+        "checksum": "Checksum",
+        "size": "Size",
+        "snippet": "Snippet",
+        "agent": "Agent",
+        "timestamp": "Accessed",
+        "provider": "Provider",
+        "arguments": "Arguments"
+      },
+      "subagent": "Subagent",
+      "unknownSource": "Unknown source",
+      "workspaceRoot": "Workspace root",
+      "viewDetails": "View details",
+      "expand": "Expand",
+      "actions": {
+        "openLink": "Open link",
+        "openFile": "Open file"
+      },
+      "emptyThread": "No sources in this thread",
+      "scope": {
+        "turn": "Current turn",
+        "thread": "All sources"
+      },
+      "sourceCount": "{{count}} sources",
+      "kind": {
+        "company_overview": "Company overview",
+        "daily_prices": "Daily prices",
+        "options_chain": "Options chain",
+        "market_index": "Market index"
+      }
+    },
     "a11y": {
       "toolCallCompleted": "completed",
       "toolCallFailed": "failed"
@@ -1237,6 +1302,31 @@
     "exportPreview": "Export Preview",
     "exportLoadError": "Could not load full content. Export may be incomplete.",
     "saveAsPdf": "Save as PDF",
+    "pdfOptions": "PDF options",
+    "pdfBranding": "Footer",
+    "pdfPageNumbers": "Page numbers",
+    "pdfScale": "Scale",
+    "openInNewTab": "Open in new tab",
+    "fullscreen": "Fullscreen",
+    "exitFullscreen": "Exit fullscreen",
+    "downloadAsHtml": "Download as HTML",
+    "moreActions": "More actions",
+    "htmlPreview": "Preview",
+    "htmlSource": "Source",
+    "pdfPrintHint": "Press Cmd/Ctrl-P to save the page as a PDF.",
+    "pdfGenerating": "Generating PDF…",
+    "copyShareLink": "Copy link",
+    "shareLinkCopied": "Shareable link copied to clipboard",
+    "shareLinkFailed": "Couldn't copy the link",
+    "directLinkCopied": "Direct link copied to clipboard",
+    "privateLinkWarningTitle": "Private link — don't share",
+    "privateLinkWarning": "This link is for your personal use — please don't share it. To share this report, use Copy link → Shareable link.",
+    "copyLinkTitle": "Copy a link to this report",
+    "copyLinkSubtitle": "Choose the right link for \"{{file}}\".",
+    "shareableLinkOption": "Shareable link",
+    "shareableLinkDesc": "To share with others: turns on public sharing for this conversation and creates a link anyone can open. While sharing is on, the whole conversation and every file in this workspace are viewable — not just this report. Turn it off any time to revoke.",
+    "directLinkOption": "Direct link (full screen)",
+    "directLinkDesc": "Just for you: opens the file full screen in a browser tab. Please don't share this link.",
     "tryAgain": "Try Again",
     "exportAnyway": "Export Anyway",
     "custom": "Custom",
@@ -1296,7 +1386,8 @@
     "tabs": {
       "files": "Files",
       "memory": "Memory",
-      "memo": "Memo"
+      "memo": "Memo",
+      "sources": "Sources"
     },
     "close": "Close panel"
   },

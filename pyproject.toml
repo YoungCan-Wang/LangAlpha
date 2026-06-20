@@ -105,6 +105,10 @@ observability = [
     "opentelemetry-instrumentation-redis>=0.62b1",
     "opentelemetry-instrumentation-logging>=0.62b1",
 ]
+# Server-side HTML→PDF export via headless Chromium. Install + run
+# `uv run playwright install chromium` to enable the `?format=pdf` routes;
+# without it the endpoints return 501 (lazy import, graceful no-op).
+pdf = ["playwright>=1.49"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ptc_agent"]
@@ -121,6 +125,7 @@ ignore = ["E741"]  # allow short names like l, O, I (common in OHLCV code)
 
 [tool.ruff.lint.per-file-ignores]
 "src/server/app/setup.py" = ["E402"]  # router imports intentionally placed after app creation
+"src/llms/__init__.py" = ["E402"]  # patch must be applied before importing modules that use langchain_anthropic
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

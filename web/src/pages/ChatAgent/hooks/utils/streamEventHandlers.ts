@@ -5,6 +5,48 @@
 
 import { normalizeAction } from './eventUtils';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from './types';
+import type { ProvenanceEvent } from '@/types/sse';
+import type { ProvenanceRecord } from '@/types/chat';
+
+/**
+ * Builds the immutable `provenanceRecords` key for a provenance record.
+ *
+ * web_search emits multiple records that share one `tool_call_id` (one per
+ * result URL), so the key prefixes the tool_call_id with `source_type` +
+ * `identifier` to keep every distinct source — grouping by tool_call_id while
+ * never dropping a sibling URL.
+ */
+export function provenanceRecordKey(record: {
+  tool_call_id?: string;
+  source_type: string;
+  identifier: string;
+}): string {
+  return `${record.tool_call_id || ''}:${record.source_type}:${record.identifier}`;
+}
+
+/**
+ * Maps a flat `provenance` SSE event to a `ProvenanceRecord`. Shared by the live
+ * (`handleProvenance`) and replay (`handleHistoryProvenance`) paths so a new
+ * field on the event only has to be wired up in one place.
+ */
+export function provenanceEventToRecord(event: ProvenanceEvent): ProvenanceRecord {
+  return {
+    record_id: event.record_id,
+    agent: event.agent,
+    timestamp: event.timestamp,
+    source_type: event.source_type,
+    identifier: event.identifier,
+    title: event.title,
+    detail: event.detail,
+    provider: event.provider,
+    tool_call_id: event.tool_call_id,
+    args_fingerprint: event.args_fingerprint,
+    args: event.args,
+    result_sha256: event.result_sha256,
+    result_size: event.result_size,
+    result_snippet: event.result_snippet,
+  };
+}
 
 /** Callback to update a subagent card by task ID. */
 type UpdateSubagentCard = (taskId: string, patch: Record<string, unknown>) => void;
@@ -233,11 +275,16 @@ export function handleTextContent({ assistantMessageId, content, finishReason, r
       // Message is requesting tool calls, don't mark as complete yet
       return false; // Let tool_calls handler process this
     } else if (!content) {
-      // Metadata chunk with finish_reason but no content
+      // Metadata chunk with finish_reason but no content. A "stopped" reason
+      // (synthetic from a user stop, live or replayed) also stamps the message
+      // so the per-message "⏹ Stopped" chip renders, and clears any in-flight
+      // tool-call chunks so the "generating (~N chars)…" preparing row stops
+      // shimmering (the partial tool call never completed and is discarded).
+      const isStopped = finishReason === 'stopped';
       setMessages((prev: MessageRecord[]) =>
         prev.map((msg: MessageRecord) =>
           msg.id === assistantMessageId
-            ? { ...msg, isStreaming: false }
+            ? { ...msg, isStreaming: false, ...(isStopped ? { stopped: true, pendingToolCallChunks: {} } : {}) }
             : msg
         )
       );
@@ -508,6 +555,49 @@ export function handleToolCallResult({ assistantMessageId, toolCallId, result, r
 }
 
 /**
+ * Handles provenance events during streaming.
+ *
+ * Accumulates the accessed-data record onto the assistant message's
+ * `provenanceRecords` map. The provenance event is flat (fields top-level on
+ * the event), mirroring the live `tool_call_result` reader. Records are keyed
+ * by `provenanceRecordKey` so multiple web_search URLs sharing one
+ * `tool_call_id` never collide.
+ *
+ * @param {Object} params - Handler parameters
+ * @param {string} params.assistantMessageId - ID of the assistant message being updated
+ * @param {Object} params.event - The flat provenance event
+ * @param {Function} params.setMessages - State setter for messages
+ * @returns {boolean} True if event was handled
+ */
+export function handleProvenance({ assistantMessageId, event, setMessages }: {
+  assistantMessageId: string;
+  event: ProvenanceEvent;
+  setMessages: SetMessages;
+}): boolean {
+  if (!event || !event.record_id) {
+    return false;
+  }
+
+  const record = provenanceEventToRecord(event);
+  const key = provenanceRecordKey(record);
+
+  setMessages((prev: MessageRecord[]) =>
+    prev.map((msg: MessageRecord) => {
+      if (msg.id !== assistantMessageId) return msg;
+
+      const provenanceRecords = {
+        ...((msg.provenanceRecords as Record<string, ProvenanceRecord>) || {}),
+        [key]: record,
+      };
+
+      return { ...msg, provenanceRecords };
+    })
+  );
+
+  return true;
+}
+
+/**
  * Handles artifact events with artifact_type: "todo_update" during streaming
  * @param {Object} params - Handler parameters
  * @param {string} params.assistantMessageId - ID of the assistant message being updated
@@ -529,32 +619,19 @@ export function handleTodoUpdate({ assistantMessageId, artifactType, artifactId,
 }): boolean {
   const { contentOrderCounterRef, updateTodoListCard, isNewConversation } = refs;
 
-  if (import.meta.env.DEV) {
-    console.log('[handleTodoUpdate] Called with:', { assistantMessageId, artifactType, artifactId, payload, isNewConversation });
-  }
-
   // Only handle todo_update artifacts
   if (artifactType !== 'todo_update' || !payload) {
-    if (import.meta.env.DEV) {
-      console.log('[handleTodoUpdate] Skipping - artifactType:', artifactType, 'hasPayload:', !!payload);
-    }
     return false;
   }
 
   const { total, completed, in_progress, pending } = payload;
   const todos = Array.isArray(payload.todos) ? payload.todos : [];
-  if (import.meta.env.DEV) {
-    console.log('[handleTodoUpdate] Extracted data:', { todos, total, completed, in_progress, pending });
-  }
 
   // Update floating card with todo list data (only during live streaming, not history)
   // Do this before setMessages to ensure we have the latest data
   // Always update the card if updateTodoListCard is available, even if todos array is empty
   // This ensures the card persists and shows the latest state
   if (updateTodoListCard) {
-    if (import.meta.env.DEV) {
-      console.log('[handleTodoUpdate] Updating todo list card, isNewConversation:', isNewConversation, 'todos count:', todos?.length || 0);
-    }
     updateTodoListCard(
       {
         todos,
@@ -572,28 +649,16 @@ export function handleTodoUpdate({ assistantMessageId, artifactType, artifactId,
   const baseTodoListId = artifactId || `todo-list-base-${Date.now()}`;
   // Create a unique segment ID that includes timestamp to ensure chronological ordering
   const segmentId = `${baseTodoListId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  if (import.meta.env.DEV) {
-    console.log('[handleTodoUpdate] Using baseTodoListId:', baseTodoListId, 'segmentId:', segmentId);
-  }
 
   setMessages((prev: MessageRecord[]) => {
-    if (import.meta.env.DEV) {
-      console.log('[handleTodoUpdate] Current messages:', prev.map((m: MessageRecord) => ({ id: m.id, role: m.role, hasSegments: !!m.contentSegments, hasTodoProcesses: !!m.todoListProcesses })));
-    }
     const updated = prev.map((msg: MessageRecord) => {
       if (msg.id !== assistantMessageId) return msg;
 
-      if (import.meta.env.DEV) {
-        console.log('[handleTodoUpdate] Found matching message:', msg.id);
-      }
       const todoListProcesses = { ...((msg.todoListProcesses as Record<string, unknown>) || {}) };
       const contentSegments = [...((msg.contentSegments as Record<string, unknown>[]) || [])];
 
       // Always create a new segment for each todo_update event to preserve chronological order
       const currentOrder = eventId != null ? eventId : ++contentOrderCounterRef.current;
-      if (import.meta.env.DEV) {
-        console.log('[handleTodoUpdate] Creating new todo list segment with order:', currentOrder, 'segmentId:', segmentId);
-      }
 
       // Add new segment at the current chronological position
       contentSegments.push({
@@ -614,27 +679,14 @@ export function handleTodoUpdate({ assistantMessageId, artifactType, artifactId,
         order: currentOrder,
         baseTodoListId: baseTodoListId, // Keep reference to base ID for potential future use
       };
-      if (import.meta.env.DEV) {
-        console.log('[handleTodoUpdate] Created new todo list process:', todoListProcesses[segmentId]);
-      }
 
       const updatedMsg: MessageRecord = {
         ...msg,
         contentSegments,
         todoListProcesses,
       };
-      if (import.meta.env.DEV) {
-        console.log('[handleTodoUpdate] Updated message:', {
-          id: updatedMsg.id,
-          segmentsCount: (updatedMsg.contentSegments as unknown[])?.length,
-          todoListIds: Object.keys((updatedMsg.todoListProcesses as Record<string, unknown>) || {})
-        });
-      }
       return updatedMsg;
     });
-    if (import.meta.env.DEV) {
-      console.log('[handleTodoUpdate] Final messages after update:', updated.map((m: MessageRecord) => ({ id: m.id, segmentsCount: (m.contentSegments as unknown[])?.length, todoListIds: Object.keys((m.todoListProcesses as Record<string, unknown>) || {}) })));
-    }
     return updated;
   });
 
@@ -932,16 +984,6 @@ export function handleSubagentMessageChunk({
     const existingContent = (reasoningProcesses[reasoningId]?.content as string) || '';
     const newContent = existingContent + content;
 
-    if (import.meta.env.DEV) {
-      console.log('[handleSubagentMessageChunk] Updating reasoning content:', {
-        taskId,
-        reasoningId,
-        existingContentLength: existingContent.length,
-        newChunkLength: content.length,
-        newContentLength: newContent.length,
-      });
-    }
-
     const reasoningTitle = extractLastReasoningTitle(newContent) ?? (reasoningProcesses[reasoningId].reasoningTitle as string | null) ?? null;
     reasoningProcesses[reasoningId] = {
       ...reasoningProcesses[reasoningId],
@@ -1093,15 +1135,6 @@ export function handleSubagentToolCalls({ taskId, assistantMessageId, toolCalls,
   const taskRefs = getOrCreateTaskRefs(refs, taskId);
   const { contentOrderCounterRef } = taskRefs;
 
-  if (import.meta.env.DEV) {
-    console.log('[handleSubagentToolCalls] Processing tool calls:', {
-      taskId,
-      assistantMessageId,
-      toolCallsCount: toolCalls.length,
-      toolCallIds: toolCalls.map((tc: ToolCallRecord) => tc.id),
-    });
-  }
-
   toolCalls.forEach((toolCall: ToolCallRecord) => {
     const toolCallId = toolCall.id;
     if (toolCallId) {
@@ -1142,16 +1175,6 @@ export function handleSubagentToolCalls({ taskId, assistantMessageId, toolCalls,
           isComplete: false,
           order: currentOrder,
         };
-
-        if (import.meta.env.DEV) {
-          console.log('[handleSubagentToolCalls] Created new tool call:', {
-            taskId,
-            assistantMessageId,
-            toolCallId,
-            toolName: toolCall.name,
-            order: currentOrder,
-          });
-        }
       } else {
         toolCallProcesses[toolCallId] = {
           ...toolCallProcesses[toolCallId],
@@ -1215,18 +1238,6 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
   let messageIndex = -1;
   let targetMessage: MessageRecord | null = null;
 
-  if (import.meta.env.DEV) {
-    console.log('[handleSubagentToolCallResult] Searching for tool call:', {
-      taskId,
-      toolCallId,
-      assistantMessageId,
-      existingMessages: updatedMessages.map((m: MessageRecord) => ({
-        id: m.id,
-        toolCallIds: Object.keys((m.toolCallProcesses as Record<string, unknown>) || {}),
-      })),
-    });
-  }
-
   // First, try to find message by assistantMessageId (if provided and matches)
   if (assistantMessageId) {
     messageIndex = updatedMessages.findIndex((m: MessageRecord) => m.id === assistantMessageId);
@@ -1254,12 +1265,6 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
       if ((msg.toolCallProcesses as Record<string, unknown>)?.[toolCallId]) {
         messageIndex = i;
         targetMessage = msg;
-        if (import.meta.env.DEV) {
-          console.log('[handleSubagentToolCallResult] Found message by tool call ID:', {
-            messageId: msg.id,
-            toolCallId,
-          });
-        }
         break;
       }
     }
@@ -1365,7 +1370,6 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
   // Detect if the tool call that just completed was a failure
   // We need to check the tool call process that was just updated
   let justCompletedToolFailed = false;
-  let justCompletedToolName = '';
 
   // Find the tool call that just completed (it should be in updatedMessages now)
   for (const msg of updatedMessages) {
@@ -1374,7 +1378,6 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
     if (completedToolCall && completedToolCall.isComplete) {
       // This is the tool call that just completed
       justCompletedToolFailed = (completedToolCall.isFailed as boolean) || false;
-      justCompletedToolName = (completedToolCall.toolName as string) || '';
       break;
     }
   }
@@ -1407,15 +1410,6 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
   // - If there's an in-progress tool, show it
   // - Otherwise, clear it
   const finalCurrentTool = justCompletedToolFailed ? '' : (hasInProgressTool ? currentToolName : '');
-
-  if (import.meta.env.DEV && justCompletedToolFailed) {
-    console.log('[handleSubagentToolCallResult] Tool call failed, clearing currentTool immediately:', {
-      taskId,
-      toolCallId,
-      failedToolName: justCompletedToolName,
-      reason: 'Tool call failed, clearing currentTool immediately',
-    });
-  }
 
   // Update currentTool: clear if tool failed, otherwise use in-progress tool if any
   updateSubagentCard(taskId, {

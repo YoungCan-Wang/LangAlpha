@@ -564,6 +564,110 @@ class TestTaskArtifactEvent:
 
 
 # ---------------------------------------------------------------------------
+# WorkflowStreamHandler — provenance custom-event dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestProvenanceEvent:
+    """Tests the provenance branch of the custom-event dispatch.
+
+    The middleware emits a flat ``{"type": "provenance", ...}`` custom event
+    with ``agent=None``; the handler strips ``type``, resolves ``agent`` from
+    the LangGraph namespace, and re-emits a flat ``provenance`` SSE event whose
+    fields land at the top level (matching the frontend's ProvenanceEvent).
+    """
+
+    def _make_handler(self, background_registry=None):
+        from src.server.handlers.streaming_handler import WorkflowStreamHandler
+
+        return WorkflowStreamHandler(
+            thread_id="t-provenance",
+            run_id="r-test",
+            background_registry=background_registry,
+        )
+
+    def _dispatch(self, handler, event_data, agent_from_stream):
+        """Drive the REAL provenance transform used by the dispatch branch."""
+        prov_data = handler._resolve_provenance_event(event_data, agent_from_stream)
+        raw = handler._format_sse_event("provenance", prov_data)
+        event_line = raw.split("\n")[1]
+        parsed = json.loads(raw.split("data: ", 1)[1].rstrip("\n"))
+        return event_line, parsed
+
+    def test_provenance_event_is_flat_with_resolved_main_agent(self):
+        """Fields land at the top level; agent resolves to main with no namespace."""
+        handler = self._make_handler()
+        event_data = {
+            "type": "provenance",
+            "record_id": "rec-001",
+            "source_type": "web_search",
+            "identifier": "https://example.com/article",
+            "title": "Example Article",
+            "provider": "tavily",
+            "tool_call_id": "tc-001",
+            "args_fingerprint": {"query": "example"},
+            "result_sha256": "abc123",
+            "result_size": 4096,
+            "result_snippet": "snippet text",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "agent": None,
+        }
+        event_line, parsed = self._dispatch(handler, event_data, agent_from_stream=())
+
+        assert event_line == "event: provenance"
+        # type becomes the event name, not a payload field
+        assert "type" not in parsed
+        # main agent (empty namespace) is pinned to "main", honoring the
+        # "main" | "task:{id}" contract (not the _extract_agent_name fallback).
+        assert parsed["agent"] == "main"
+        # all middleware fields pass through flat
+        assert parsed["record_id"] == "rec-001"
+        assert parsed["source_type"] == "web_search"
+        assert parsed["identifier"] == "https://example.com/article"
+        assert parsed["title"] == "Example Article"
+        assert parsed["provider"] == "tavily"
+        assert parsed["tool_call_id"] == "tc-001"
+        assert parsed["args_fingerprint"] == {"query": "example"}
+        assert parsed["result_sha256"] == "abc123"
+        assert parsed["result_size"] == 4096
+        assert parsed["result_snippet"] == "snippet text"
+        assert parsed["timestamp"] == "2024-01-01T00:00:00Z"
+        # no nested data envelope
+        assert "data" not in parsed
+
+    def test_provenance_event_resolves_subagent_attribution(self):
+        """A registered subagent namespace yields task:{id} attribution."""
+        from src.ptc_agent.agent.middleware.background_subagent.registry import (
+            BackgroundTaskRegistry,
+        )
+
+        registry = BackgroundTaskRegistry(thread_id="t-provenance")
+        task = MagicMock()
+        task.task_id = "sub42"
+        registry._tasks["tc-sub"] = task
+        registry._ns_uuid_to_tool_call_id["ns-uuid-1"] = "tc-sub"
+
+        handler = self._make_handler(background_registry=registry)
+        event_data = {
+            "type": "provenance",
+            "record_id": "rec-002",
+            "source_type": "file_read",
+            "identifier": "work/notes.md",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "agent": None,
+        }
+        # namespace last element matches the registered uuid
+        event_line, parsed = self._dispatch(
+            handler, event_data, agent_from_stream=("tools:ns-uuid-1",)
+        )
+
+        assert event_line == "event: provenance"
+        assert parsed["agent"] == "task:sub42"
+        assert parsed["source_type"] == "file_read"
+        assert parsed["identifier"] == "work/notes.md"
+
+
+# ---------------------------------------------------------------------------
 # WorkflowStreamHandler — event_counter integration
 # ---------------------------------------------------------------------------
 
@@ -861,3 +965,155 @@ class TestCompactionChunkRouting:
         # Simulate the error-signal discard path
         handler._compaction_windows.discard(ns)
         assert ns not in handler._compaction_windows
+
+
+# ---------------------------------------------------------------------------
+# Stop-point reconciliation (decision 1b / T3-A): finalize_stopped_events
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeStoppedEvents:
+    """A user stop must close every open streaming structure so replay shows
+    partial fragments marked 'stopped' instead of live-looking zombies."""
+
+    def _handler(self, thread_id="t-stop"):
+        from src.server.handlers.streaming_handler import WorkflowStreamHandler
+
+        return WorkflowStreamHandler(thread_id=thread_id, run_id="r-stop")
+
+    def _events(self, handler):
+        return handler.get_sse_events() or []
+
+    def test_mid_reasoning_gets_reasoning_complete(self):
+        handler = self._handler()
+        # Simulate an open reasoning block on the main agent.
+        handler.reasoning_active.add("agent")
+        handler._open_message_ids["agent"] = "msg-1"
+
+        out = handler.finalize_stopped_events()
+
+        # A reasoning_signal:"complete" was appended for the open block.
+        assert any(
+            e["event"] in ("message_chunk", "compaction_chunk")
+            and e["data"].get("content_type") == "reasoning_signal"
+            and e["data"].get("content") == "complete"
+            for e in out
+        )
+        # Reasoning state cleared.
+        assert not handler.reasoning_active
+
+    def test_mid_tool_args_gets_terminal_close(self):
+        handler = self._handler()
+        # Simulate an in-flight Anthropic tool-call stream.
+        handler.anthropic_tool_call_state[("agent", 0)] = {
+            "name": "execute_code",
+            "id": "call-1",
+            "args_accumulated": '{"code": "import pa',
+        }
+        handler._open_message_ids["agent"] = "msg-tool"
+
+        out = handler.finalize_stopped_events()
+
+        assert any(
+            e["event"] == "tool_call_chunks"
+            and e["data"].get("finish_reason") == "stopped"
+            for e in out
+        )
+        assert not handler.anthropic_tool_call_state
+
+    def test_same_agent_in_both_tool_states_closes_once(self):
+        """A mid-turn provider fallback can leave the same agent in both the
+        Response-API and Anthropic tool-call dicts; the stop must emit exactly
+        one tool-call close for that agent, not two."""
+        handler = self._handler()
+        handler.function_call_state[("agent", 0)] = {"name": "execute_code", "id": "c1"}
+        handler.anthropic_tool_call_state[("agent", 1)] = {"name": "execute_code", "id": "c2"}
+        handler._open_message_ids["agent"] = "msg-tool"
+
+        out = handler.finalize_stopped_events()
+
+        tool_closes = [
+            e
+            for e in out
+            if e["event"] == "tool_call_chunks"
+            and e["data"].get("agent") == "agent"
+            and e["data"].get("finish_reason") == "stopped"
+        ]
+        assert len(tool_closes) == 1
+        assert not handler.function_call_state
+        assert not handler.anthropic_tool_call_state
+
+    def test_mid_artifact_gets_stopped_status(self):
+        handler = self._handler()
+        # Simulate an in-progress artifact.
+        handler._open_artifacts["art-1"] = {
+            "artifact_type": "chart",
+            "artifact_id": "art-1",
+            "agent": "agent",
+            "status": "in_progress",
+            "payload": {},
+        }
+
+        out = handler.finalize_stopped_events()
+
+        assert any(
+            e["event"] == "artifact"
+            and e["data"].get("artifact_id") == "art-1"
+            and e["data"].get("status") == "stopped"
+            for e in out
+        )
+        assert not handler._open_artifacts
+
+    def test_open_message_gets_finish_reason_stopped(self):
+        handler = self._handler()
+        handler._open_message_ids["agent"] = "msg-open"
+
+        out = handler.finalize_stopped_events()
+
+        assert any(
+            e["event"] == "message_chunk"
+            and e["data"].get("id") == "msg-open"
+            and e["data"].get("finish_reason") == "stopped"
+            for e in out
+        )
+        assert not handler._open_message_ids
+
+    def test_clean_boundary_appends_no_synthetic_events(self):
+        """Negative case: nothing open ⇒ no synthetic close events."""
+        handler = self._handler()
+        # A clean, already-closed message with a terminal finish_reason.
+        handler._format_sse_event(
+            "message_chunk",
+            {
+                "thread_id": "t-stop",
+                "agent": "agent",
+                "id": "msg-done",
+                "role": "assistant",
+                "content": "done.",
+                "finish_reason": "stop",
+            },
+        )
+        before = self._events(handler)
+
+        out = handler.finalize_stopped_events()
+
+        # No new events were appended.
+        assert len(out) == len(before)
+        assert not any(
+            e["data"].get("finish_reason") == "stopped" for e in out
+        )
+
+    def test_idempotent_double_stop_no_duplicate_closes(self):
+        """The stop-finalized marker prevents duplicate synthetic closes on a
+        second stop / handler re-entry."""
+        handler = self._handler()
+        handler.reasoning_active.add("agent")
+        handler._open_message_ids["agent"] = "msg-1"
+
+        first = handler.finalize_stopped_events()
+        first_len = len(first)
+
+        second = handler.finalize_stopped_events()
+
+        assert len(second) == first_len
+        assert handler._stop_finalized is True

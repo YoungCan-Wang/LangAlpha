@@ -1,7 +1,7 @@
 import React, { Suspense, useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, FolderOpen, StopCircle, ScrollText, CheckCircle2, Circle, Loader2, TextSelect, Minus, PanelLeftOpen, Menu, Info } from 'lucide-react';
+import { ArrowLeft, FolderOpen, ScrollText, CheckCircle2, Circle, Loader2, TextSelect, Minus, PanelLeftOpen, Menu, Info, Pin, PinOff } from 'lucide-react';
 import { HoverCard, HoverCardTrigger, HoverCardContent } from '@/components/ui/hover-card';
 import { useIsMobile, getIsMobileSnapshot } from '@/hooks/useIsMobile';
 import { useNarrowContainer } from '@/hooks/useNarrowContainer';
@@ -10,11 +10,15 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { updateCurrentUser } from '../../Dashboard/utils/api';
-import { softInterruptWorkflow, getWorkspace, summarizeThread, offloadThread, getPreviewUrl } from '../utils/api';
+import { getWorkspace, summarizeThread, offloadThread, getPreviewUrl, getThreadShareStatus, updateThreadSharing } from '../utils/api';
+import { buildSharedServeUrl, buildWsfilesUrl } from './viewers/html/wsfilesUrl';
+import ShareReportLinkModal from './ShareReportLinkModal';
+import { toast } from '@/components/ui/use-toast';
 import { mergeWarmingDisplay } from '../utils/warmWorkspace';
 import { useChatMessages } from '../hooks/useChatMessages';
 import { saveChatSession, getChatSession, clearChatSession } from '../hooks/utils/chatSessionRestore';
 import type { PreviewData } from '../hooks/utils/types';
+import type { ProvenanceRecord } from '@/types/chat';
 import { clampPanelWidth as clampPanelWidthUtil } from '@/lib/panelUtils';
 import { useCardState } from '../hooks/useCardState';
 import { useWorkspaceFiles } from '../hooks/useWorkspaceFiles';
@@ -35,6 +39,7 @@ import MessageList, { normalizeSubagentText } from './MessageList';
 import { SubagentTelemetryContext } from './SubagentTelemetryContext';
 import Markdown from './Markdown';
 import NavigationPanel from './NavigationPanel';
+import NavDisplayOptions from './NavDisplayOptions';
 import ChatMinimap from './ChatMinimap';
 import { useNavigationData } from '../hooks/useNavigationData';
 import ShareButton from './ShareButton';
@@ -213,7 +218,18 @@ interface SubagentStatusIndicatorProps {
 
 // Shared nav panel state across ChatView instances — when switching threads,
 // the newly active instance inherits this so the panel stays open.
-const _sharedNav = { visible: false, locked: false };
+// `pinned` is persisted and read synchronously at module load so a reload
+// mounts the panel docked without a flash. Pinning is desktop-only; mobile
+// keeps the hamburger/drawer flow and ignores `pinned`.
+const NAV_PIN_KEY = 'nav.pinned';
+function readNavPinned(): boolean {
+  try {
+    return localStorage.getItem(NAV_PIN_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+const _sharedNav = { visible: false, locked: false, pinned: readNavPinned() };
 
 // Static main agent object — never changes, so defined once at module level
 const MAIN_AGENT: AgentInfo = {
@@ -300,9 +316,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const chatInputRef = useRef<ChatInputHandle>(null);
   const location = useLocation();
   const navigate = useNavigate();
-  const { preferences } = usePreferences();
+  usePreferences();
   const queryClient = useQueryClient();
   const initialMessageSentRef = useRef(false);
+  // Guards one-shot consumption of the ?file= deep link (report share / copy link).
+  const fileDeepLinkConsumedRef = useRef(false);
   // Determine agent mode: flash workspaces use flash mode, otherwise ptc
   const state = location.state as LocationState | null;
   const [agentMode, setAgentMode] = useState(state?.agentMode || 'ptc');
@@ -313,6 +331,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const [filePanelTargetMemoryKey, setFilePanelTargetMemoryKey] = useState<string | null>(null);
   const [filePanelTargetMemoryTier, setFilePanelTargetMemoryTier] = useState<MemoryTier | null>(null);
   const [filePanelTargetMemoKey, setFilePanelTargetMemoKey] = useState<string | null>(null);
+  // Message id whose provenance the Sources tab shows. Stays set while the
+  // Sources tab is open so the tab chrome persists; cleared on panel close.
+  const [filePanelTargetSources, setFilePanelTargetSources] = useState<string | null>(null);
   // Stable handlers — these land in useEffect deps in MemoryPanel/MemoPanel/
   // FilePanel. Inline arrows would create a new identity on every ChatView
   // render, re-triggering those effects on every streaming chunk (the
@@ -358,16 +379,23 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const [activeAgentId, setActiveAgentId] = useState(
     initialTaskId ? `task:${initialTaskId}` : 'main'
   );
-  // Navigation panel visibility (hover-triggered overlay)
+  // Navigation panel visibility (hover-triggered overlay, or docked when pinned)
   // Initialize from shared state so thread switches inherit the panel's open/closed state.
-  const [navPanelVisible, setNavPanelVisible] = useState(_sharedNav.visible);
-  const navPanelVisibleRef = useRef(_sharedNav.visible);
+  // Pinned (desktop only) forces the panel visible from first paint.
+  const initialNavOpen = _sharedNav.visible || (_sharedNav.pinned && !isMobile);
+  const [navPanelVisible, setNavPanelVisible] = useState(initialNavOpen);
+  const navPanelVisibleRef = useRef(initialNavOpen);
+  const [navPinned, setNavPinned] = useState(_sharedNav.pinned);
+  const navPinnedRef = useRef(_sharedNav.pinned);
   const navHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navLockedRef = useRef(_sharedNav.locked);
   const contentAreaRef = useRef<HTMLDivElement>(null);
   const contentAreaWidthRef = useRef<number>(0);
-  // Skip nav panel slide-in on mount if already open (inherited from previous thread).
-  const skipNavAnimRef = useRef(_sharedNav.visible);
+  // True when the content area is too narrow for the docked push layout; a
+  // pinned panel then stays visible but overlays without pushing content.
+  const [contentNarrow, setContentNarrow] = useState(false);
+  // Skip nav panel slide-in on mount if already open (inherited from previous thread or pinned).
+  const skipNavAnimRef = useRef(initialNavOpen);
   useEffect(() => { skipNavAnimRef.current = false; return () => { if (navHideTimerRef.current) clearTimeout(navHideTimerRef.current); }; }, []);
   // Auto-close nav panel when content area shrinks below threshold (e.g., right panel opens)
   useEffect(() => {
@@ -381,7 +409,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       // Skip when view is hidden (display:none reports width 0) to avoid
       // corrupting _sharedNav for the incoming active view.
       if (!isActiveRef.current) return;
-      if (width < 1100 && navPanelVisibleRef.current) {
+      setContentNarrow(width < 1100);
+      // Pinned panels never auto-collapse — they fall back to overlay-without-push instead.
+      if (width < 1100 && navPanelVisibleRef.current && !navPinnedRef.current) {
         if (navHideTimerRef.current) clearTimeout(navHideTimerRef.current);
         navPanelVisibleRef.current = false;
         _sharedNav.visible = false;
@@ -401,8 +431,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const [showSystemFiles, setShowSystemFiles] = useState(
     () => localStorage.getItem('filePanel.showSystemFiles') === 'true'
   );
-  // Track whether the agent was soft-interrupted
-  const [wasInterrupted, setWasInterrupted] = useState(false);
+  // Track whether the user hard-stopped the current turn (drives the
+  // "⏹ Stopped" marker + placeholder). Cleared on the next send.
+  const [wasStopped, setWasStopped] = useState(false);
   // Track intentional back navigation (skip session save on unmount)
   const intentionalExitRef = useRef(false);
   // Ref mirrors isActive prop for use in unmount cleanup closures (R1)
@@ -576,6 +607,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     expandWorkspace: navExpandWorkspace,
     hasMore: navHasMore,
     loadAll: navLoadAll,
+    loadMoreThreads: navLoadMoreThreads,
+    reorderWorkspace: navReorderWorkspace,
+    canReorderWorkspaces: navCanReorderWorkspaces,
+    pinWorkspace: navPinWorkspace,
+    renameWorkspace: navRenameWorkspace,
   } = useNavigationData(workspaceId);
 
   // Navigate to a different thread from the navigation panel
@@ -591,6 +627,23 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       },
     });
   }, [navigate, navWorkspaces, workspaceName]);
+
+  // Open a fresh thread in a workspace from the nav panel. `__default__` + a
+  // workspaceId in route state resolves to a brand-new thread (ChatAgent only
+  // restores a stored session for the bare /chat route), mirroring the new-
+  // workspace navigation path.
+  const handleNewThread = useCallback((wsId: string) => {
+    const ws = (navWorkspaces as Record<string, unknown>[]).find((w) => (w as Record<string, unknown>).workspace_id === wsId) as Record<string, unknown> | undefined;
+    const status = (ws?.status as string) || null;
+    navigate('/chat/t/__default__', {
+      state: {
+        workspaceId: wsId,
+        workspaceName: (ws?.name as string) || '',
+        workspaceStatus: status,
+        agentMode: status === 'flash' ? 'flash' : 'ptc',
+      },
+    });
+  }, [navigate, navWorkspaces]);
 
   // Stable ref-based callback for opening preview URLs from SSE events.
   // Defined here so it can be passed to useChatMessages; assigned after
@@ -614,6 +667,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     returnedSteering,
     clearReturnedSteering,
     handleSendMessage,
+    stopWorkflow,
     pendingInterrupt,
     pendingRejection,
     handleApproveInterrupt,
@@ -656,12 +710,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   const chatPlaceholder = useMemo(() => {
     if (pendingRejection) return t('chat.placeholderPendingRejection');
-    if (wasInterrupted && !isLoading && !pendingInterrupt && !pendingRejection)
-      return t('chat.placeholderInterrupted');
+    if (wasStopped && !isLoading && !pendingInterrupt && !pendingRejection)
+      return t('chat.placeholderStopped');
     if (isLoading) return t('chat.placeholderLoading');
     if (hasActiveSubagents) return t('chat.placeholderSubagentsRunning');
     return t('chat.placeholderDefault');
-  }, [pendingRejection, wasInterrupted, isLoading, pendingInterrupt, hasActiveSubagents, t]);
+  }, [pendingRejection, wasStopped, isLoading, pendingInterrupt, hasActiveSubagents, t]);
 
   // Restore steering text to input when agent finishes without consuming it
   useEffect(() => {
@@ -676,6 +730,70 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   currentThreadIdRef.current = currentThreadId;
   // Keep resolvedThreadIdRef in sync with the resolved thread ID from useChatMessages
   resolvedThreadIdRef.current = currentThreadId || threadId;
+
+  // Copy-a-link to an HTML report opens a consent chooser; the actual copy runs
+  // in one of the two handlers below depending on the user's pick.
+  const [shareLinkFile, setShareLinkFile] = useState<string | null>(null);
+
+  const handleCopyShareLink = useCallback((filePath: string) => {
+    setShareLinkFile(filePath);
+  }, []);
+
+  // Shareable link: public, revocable, token-scoped. Enables thread sharing
+  // with allow_files on first use (always fetching live status first, so
+  // spreading the current permissions preserves any existing allow_download
+  // rather than clearing it), then copies the public serve URL. Throws on
+  // failure so the chooser stays open.
+  const copyShareableReportLink = useCallback(async () => {
+    const filePath = shareLinkFile;
+    const tid = currentThreadIdRef.current;
+    if (!filePath || !tid) return;
+    try {
+      let status = await getThreadShareStatus(tid);
+      if (!status?.is_shared || !status?.share_token) {
+        status = await updateThreadSharing(tid, {
+          is_shared: true,
+          permissions: { ...(status?.permissions || {}), allow_files: true },
+        });
+      } else if (!status.permissions?.allow_files) {
+        status = await updateThreadSharing(tid, {
+          is_shared: true,
+          permissions: { ...status.permissions, allow_files: true },
+        });
+      }
+      const token = status?.share_token;
+      if (!token) throw new Error('No share token');
+      // buildSharedServeUrl encodes each path segment but preserves slashes, so
+      // relative subresources still resolve. It's relative when the API base is
+      // same-origin (the nginx case); make it absolute for a copyable link.
+      const served = buildSharedServeUrl(token, filePath);
+      const url = /^https?:\/\//i.test(served) ? served : `${window.location.origin}${served}`;
+      await navigator.clipboard.writeText(url);
+      toast({ description: t('filePanel.shareLinkCopied') });
+    } catch (e) {
+      console.error('[ChatView] Copy shareable link failed:', e);
+      toast({ description: t('filePanel.shareLinkFailed'), variant: 'destructive' });
+      throw e;
+    }
+  }, [shareLinkFile, t]);
+
+  // Direct link: the raw wsfiles URL (workspace UUID is the credential). Renders
+  // the file full screen. No sharing is enabled, but the link is not revocable
+  // and reaches the whole workspace. Throws on failure so the chooser stays open.
+  const copyDirectReportLink = useCallback(async () => {
+    const filePath = shareLinkFile;
+    if (!filePath) return;
+    try {
+      const served = buildWsfilesUrl(workspaceId, filePath);
+      const url = /^https?:\/\//i.test(served) ? served : `${window.location.origin}${served}`;
+      await navigator.clipboard.writeText(url);
+      toast({ description: t('filePanel.directLinkCopied') });
+    } catch (e) {
+      console.error('[ChatView] Copy direct link failed:', e);
+      toast({ description: t('filePanel.shareLinkFailed'), variant: 'destructive' });
+      throw e;
+    }
+  }, [shareLinkFile, workspaceId, t]);
 
   // Save chat session on unmount for cross-tab restoration (workspace + thread only).
   // Only the active view saves — evicted hidden views must not overwrite (R1).
@@ -705,17 +823,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
   }, [workspaceId]);
 
-  // Soft-interrupt handler: pauses main agent while keeping subagents running
-  const handleSoftInterrupt = useCallback(async () => {
-    const tid = currentThreadId || threadId;
-    if (!tid || tid === '__default__') return;
-    try {
-      await softInterruptWorkflow(tid);
-      setWasInterrupted(true);
-    } catch (e) {
-      console.warn('[ChatView] Failed to soft-interrupt workflow:', e);
-    }
-  }, [currentThreadId, threadId]);
+  // Hard-stop handler: terminates the current turn immediately (main agent +
+  // all subagents) while preserving state. The hook's stopWorkflow aborts the
+  // client reader, finalizes the open message, and POSTs /cancel; we flip the
+  // "⏹ Stopped" marker here.
+  const handleStop = useCallback(() => {
+    setWasStopped(true);
+    void stopWorkflow();
+  }, [stopWorkflow]);
 
   // Wrapper: converts ChatInput's (message, planMode, attachments, slashCommands) into
   // handleSendMessage(message, planMode, additionalContext, attachmentMeta)
@@ -837,7 +952,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     const wasLoading = prevLoadingRef.current;
     prevLoadingRef.current = isLoading;
     if (isLoading && !wasLoading) {
-      setWasInterrupted(false);
+      setWasStopped(false);
     }
     if (!isLoading && wasLoading) {
       refreshFiles();
@@ -1091,6 +1206,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     setFilePanelTargetMemoryKey(r.targetMemoryKey);
     setFilePanelTargetMemoryTier(r.targetMemoryTier);
     setFilePanelTargetMemoKey(r.targetMemoKey);
+    setFilePanelTargetSources(null);
     if (r.clearWorkspaceId) {
       setFilePanelWorkspaceId(null);
     } else if (r.setWorkspaceId) {
@@ -1106,6 +1222,80 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // file-panel handoffs) that still use the older name. Pure identity — the
   // unified router does the path-aware classification on every call.
   const handleOpenFileFromChat = handleOpenAgentArtifactFromChat;
+
+  // Opens the Sources tab for a turn. Clears the sibling file/memory/memo
+  // targets first (so RightPanel's snap-back precedence converges on Sources)
+  // and pins the message id; the panel resolves live records from `messages`.
+  const handleOpenSourcesFromChat = useCallback((messageId: string) => {
+    setFilePanelTargetFile(null);
+    setFilePanelTargetDir(null);
+    setFilePanelTargetMemoryKey(null);
+    setFilePanelTargetMemoryTier(null);
+    setFilePanelTargetMemoKey(null);
+    setFilePanelTargetSources(messageId);
+
+    setRightPanelWidth(clampPanelWidth(850));
+    setRightPanelType('file');
+    pushPanelHistory();
+  }, [clampPanelWidth, pushPanelHistory]);
+
+  // Live provenance for the targeted turn — resolved from `messages` so the
+  // Sources panel updates as records stream in (live) or replay re-delivers
+  // them (reload). Recomputes on every `messages` change while the tab is open.
+  const sourcesRecords = useMemo<Record<string, ProvenanceRecord> | undefined>(() => {
+    if (!filePanelTargetSources) return undefined;
+    const msg = messages.find((m) => (m as { id?: string }).id === filePanelTargetSources);
+    return (msg as { provenanceRecords?: Record<string, ProvenanceRecord> } | undefined)?.provenanceRecords;
+  }, [filePanelTargetSources, messages]);
+
+  // Thread-wide provenance: every turn's records merged in chronological order.
+  // The Sources panel dedups across turns (first occurrence wins) and offers a
+  // "This turn / All sources" switch when this set is larger than the turn's.
+  // Gated on an open Sources tab so we don't merge on every unrelated render.
+  const allSourcesRecords = useMemo<Record<string, ProvenanceRecord> | undefined>(() => {
+    if (!filePanelTargetSources) return undefined;
+    const merged: Record<string, ProvenanceRecord> = {};
+    for (const m of messages) {
+      const recs = (m as { provenanceRecords?: Record<string, ProvenanceRecord> }).provenanceRecords;
+      if (!recs) continue;
+      // First occurrence wins: keep the earliest turn's metadata for a colliding
+      // key (Object.assign would let later turns overwrite — last-wins).
+      for (const key in recs) {
+        if (!(key in merged)) merged[key] = recs[key];
+      }
+    }
+    return merged;
+  }, [filePanelTargetSources, messages]);
+
+  // Drop the Sources target whenever the right panel is closed or switches to a
+  // non-file view (detail/preview), so a later file/memory click doesn't reopen
+  // the Sources tab. The many close call sites all funnel through rightPanelType.
+  useEffect(() => {
+    if (rightPanelType !== 'file' && filePanelTargetSources != null) {
+      setFilePanelTargetSources(null);
+    }
+  }, [rightPanelType, filePanelTargetSources]);
+
+  // One-shot ?file= deep link: opens the file panel targeting that file. Gated
+  // on isActive so only the visible ChatView consumes it (ChatAgent keeps cached
+  // hidden instances), and on workspaceId so the panel has something to read.
+  // The param is stripped after consuming so it can't re-fire on re-render.
+  useEffect(() => {
+    if (!isActive || !workspaceId || fileDeepLinkConsumedRef.current) return;
+    const params = new URLSearchParams(location.search);
+    const raw = params.get('file');
+    if (!raw) return;
+    fileDeepLinkConsumedRef.current = true;
+    // URLSearchParams.get already percent-decodes; a second decodeURIComponent
+    // would throw on a literal '%' in the filename (e.g. 100%25_report.html).
+    handleOpenFileFromChat(raw);
+    params.delete('file');
+    const search = params.toString();
+    navigate(
+      { pathname: location.pathname, search: search ? `?${search}` : '' },
+      { replace: true, state: location.state },
+    );
+  }, [isActive, workspaceId, location.search, location.pathname, location.state, navigate, handleOpenFileFromChat]);
 
   // Open file panel filtered to a specific directory. Clears every other
   // target first — symmetric with handleOpenAgentArtifactFromChat — so a
@@ -1361,6 +1551,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   // Navigation panel hover handlers with 30s hide delay
   const handleNavEnter = useCallback(() => {
+    if (navPinnedRef.current) return; // pinned panel ignores the hover dance
     if (navLockedRef.current) return; // locked after explicit minimize
     // Don't open if content area is too narrow (e.g., right panel consuming space)
     if ((contentAreaRef.current?.offsetWidth ?? Infinity) < 1100) return;
@@ -1371,6 +1562,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   }, []);
 
   const handleNavLeave = useCallback(() => {
+    if (navPinnedRef.current) return; // pinned panel never auto-hides
     if (navLockedRef.current) return;
     navHideTimerRef.current = setTimeout(() => {
       if (!isActiveRef.current) return;
@@ -1397,6 +1589,31 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     const container = getScrollContainer(ref);
     container?.scrollTo({ top: 0, behavior: 'smooth' });
   }, [isMobile, activeAgentId, getScrollContainer]);
+
+  // Pin toggle: pin docks the panel open (persisted); unpin returns to hover mode.
+  const handleTogglePin = useCallback(() => {
+    const next = !navPinnedRef.current;
+    navPinnedRef.current = next;
+    _sharedNav.pinned = next;
+    try {
+      localStorage.setItem(NAV_PIN_KEY, String(next));
+    } catch {
+      // localStorage unavailable (private mode) — pin still works for the session
+    }
+    setNavPinned(next);
+    if (next) {
+      if (navHideTimerRef.current) clearTimeout(navHideTimerRef.current);
+      navLockedRef.current = false;
+      _sharedNav.locked = false;
+      navPanelVisibleRef.current = true;
+      _sharedNav.visible = true;
+      setNavPanelVisible(true);
+    } else {
+      navPanelVisibleRef.current = false;
+      _sharedNav.visible = false;
+      setNavPanelVisible(false);
+    }
+  }, []);
 
   // Expand button explicitly unlocks and opens the panel
   const handleNavExpand = useCallback(() => {
@@ -1535,7 +1752,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // Hidden views notify parent via onThreadResolved but skip URL navigate.
   useEffect(() => {
     if (currentThreadId && currentThreadId !== '__default__' && currentThreadId !== threadId && workspaceId) {
-      console.log('[ChatView] Thread ID changed from', threadId, 'to', currentThreadId, '- updating URL');
       // Notify parent so the cache key updates in-place (preserves instanceId)
       onThreadResolved?.(threadId, currentThreadId);
       if (isActive) {
@@ -1793,14 +2009,19 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       // hover trigger zone works again after a minimize + thread switch.
       navLockedRef.current = false;
       _sharedNav.locked = false;
+      // Sync pin state — it may have been toggled in another instance.
+      // Pinned forces visibility on desktop; mobile ignores it (drawer flow).
+      navPinnedRef.current = _sharedNav.pinned;
+      setNavPinned(_sharedNav.pinned);
+      const wantNavVisible = _sharedNav.visible || (_sharedNav.pinned && !getIsMobileSnapshot());
       // Sync nav panel from shared state
-      navPanelVisibleRef.current = _sharedNav.visible;
-      setNavPanelVisible(_sharedNav.visible);
+      navPanelVisibleRef.current = wantNavVisible;
+      setNavPanelVisible(wantNavVisible);
       // Skip slide-in animation if inheriting open state
-      if (_sharedNav.visible) skipNavAnimRef.current = true;
+      if (wantNavVisible) skipNavAnimRef.current = true;
 
       requestAnimationFrame(() => {
-        if (_sharedNav.visible) skipNavAnimRef.current = false;
+        if (wantNavVisible) skipNavAnimRef.current = false;
         const container = getScrollContainer(scrollAreaRef);
         if (container) {
           container.scrollTo({ top: container.scrollHeight });
@@ -1838,21 +2059,18 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       <div aria-live="polite" aria-atomic="false" className="sr-only">
         {recentlyCompletedAnnouncement}
       </div>
+      <ShareReportLinkModal
+        open={shareLinkFile !== null}
+        fileName={shareLinkFile?.split('/').pop() || ''}
+        onCopyShareable={copyShareableReportLink}
+        onCopyDirect={copyDirectReportLink}
+        onClose={() => setShareLinkFile(null)}
+      />
       {/* Left Side: Topbar + Sidebar + Chat Window */}
       <div className="flex flex-col flex-1 min-w-0">
         {/* Top bar */}
         <div className="flex items-center justify-between px-4 py-2 border-b min-w-0 flex-shrink-0" style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
           <div className="flex items-center gap-4 min-w-0 flex-shrink">
-            {isMobile && (
-              <button
-                onClick={handleNavExpand}
-                className="p-2 rounded-md transition-colors flex-shrink-0"
-                style={{ color: 'var(--color-text-primary)' }}
-                title="Menu"
-              >
-                <Menu className="h-5 w-5" />
-              </button>
-            )}
             <button
               onClick={() => {
                 if (activeAgentId !== 'main') {
@@ -1880,6 +2098,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             >
               <ArrowLeft className="h-5 w-5" />
             </button>
+            {isMobile && (
+              <button
+                onClick={handleNavExpand}
+                className="p-2 rounded-md transition-colors flex-shrink-0"
+                style={{ color: 'var(--color-text-primary)' }}
+                title="Menu"
+              >
+                <Menu className="h-5 w-5" />
+              </button>
+            )}
             <h1 className="text-base font-semibold whitespace-nowrap title-font truncate" style={{ color: 'var(--color-text-primary)' }}>
               {workspaceName || t('thread.workspace')}
             </h1>
@@ -1995,29 +2223,60 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   } : {})}
                   style={{ width: '100%', height: '100%', position: 'absolute', left: 0, top: 0 }}
                 >
-                  {/* Minimize button — top right corner */}
-                  <button
-                    onClick={handleNavMinimize}
-                    className="nav-panel-dismiss-btn"
-                    style={{
-                      position: 'absolute',
-                      top: 8,
-                      right: 8,
-                      zIndex: 2,
-                      padding: 4,
-                      background: 'transparent',
-                      border: 'none',
-                      cursor: 'pointer',
-                      borderRadius: 4,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                    }}
-                    title="Minimize panel"
-                  >
-                    <Minus className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
-                  </button>
                   <NavigationPanel
+                    headerActions={
+                      <>
+                        {/* Sidebar display options (workspace/thread visibility) —
+                            pinned to the left edge; margin-right:auto pushes the pin +
+                            minimize controls to the right of the header row. */}
+                        <div style={{ marginRight: 'auto', display: 'flex', alignItems: 'center' }}>
+                          <NavDisplayOptions />
+                        </div>
+                        {/* Pin toggle — desktop only, next to the minimize button */}
+                        {!isMobile && (
+                          <button
+                            onClick={handleTogglePin}
+                            className="nav-panel-dismiss-btn"
+                            aria-pressed={navPinned}
+                            style={{
+                              padding: 4,
+                              background: 'transparent',
+                              border: 'none',
+                              cursor: 'pointer',
+                              borderRadius: 4,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                            }}
+                            title={navPinned ? t('nav.unpin') : t('nav.pin')}
+                            aria-label={navPinned ? t('nav.unpin') : t('nav.pin')}
+                          >
+                            {navPinned
+                              ? <PinOff className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
+                              : <Pin className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />}
+                          </button>
+                        )}
+                        {/* Minimize button — while pinned it unpins (un-docks) */}
+                        <button
+                          onClick={!isMobile && navPinned ? handleTogglePin : handleNavMinimize}
+                          className="nav-panel-dismiss-btn"
+                          style={{
+                            padding: 4,
+                            background: 'transparent',
+                            border: 'none',
+                            cursor: 'pointer',
+                            borderRadius: 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                          title={!isMobile && navPinned ? t('nav.unpin') : t('nav.minimize')}
+                          aria-label={!isMobile && navPinned ? t('nav.unpin') : t('nav.minimize')}
+                        >
+                          <Minus className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+                        </button>
+                      </>
+                    }
                     workspaces={navWorkspaces}
                     workspaceThreads={navWorkspaceThreads}
                     currentWorkspaceId={workspaceId}
@@ -2030,17 +2289,26 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     onNavigateThread={handleNavigateThread}
                     hasMore={navHasMore}
                     onLoadMore={navLoadAll}
+                    onLoadMoreThreads={navLoadMoreThreads}
+                    onReorderWorkspace={navCanReorderWorkspaces ? navReorderWorkspace : undefined}
+                    onPinWorkspace={navPinWorkspace}
+                    onRenameWorkspace={navRenameWorkspace}
+                    onNewThread={handleNewThread}
                   />
                 </motion.div>
               )}
             </AnimatePresence>
           </div>
 
-          {/* Chat Window — nudge right when nav panel is open so content clears the overlay */}
+          {/* Chat Window — nudge right when nav panel is open so content clears the overlay.
+              Pinned + narrow content (e.g. right panel open): keep the panel visible but
+              drop the push so chat isn't crushed — the panel overlays instead. */}
           <div
             className="flex-1 flex flex-col overflow-hidden min-w-0"
             style={{
-              paddingLeft: !isMobile && navPanelVisible ? 'min(320px, max(0px, calc(1424px - 100%)))' : 0,
+              paddingLeft: !isMobile && navPanelVisible && !(navPinned && contentNarrow)
+                ? 'min(320px, max(0px, calc(1424px - 100%)))'
+                : 0,
               transition: 'padding-left 0.2s cubic-bezier(0.22, 1, 0.36, 1)',
             }}
           >
@@ -2087,6 +2355,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         isLoadingHistory={isLoadingHistory}
                         hideAvatar={isNarrowChat}
                         onOpenFile={handleOpenFileFromChat}
+                        onOpenSources={handleOpenSourcesFromChat}
                         onOpenDir={handleOpenDirFromChat}
                         onToolCallDetailClick={handleToolCallDetailClick}
                         onOpenSubagentTask={handleOpenSubagentTask}
@@ -2201,18 +2470,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         <span>{t('chat.planFeedbackHint')}</span>
                       </div>
                     )}
-                    {wasInterrupted && !isLoading && !pendingInterrupt && !pendingRejection && (
-                      <div
-                        className="flex items-center gap-2 px-3 py-2 rounded-md text-sm"
-                        style={{ backgroundColor: 'var(--color-loss-soft)', color: 'var(--color-text-tertiary)' }}
-                      >
-                        <StopCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-loss)' }} />
-                        <span>{t('chat.interruptedHint')}</span>
-                      </div>
-                    )}
                     {messageError && !isLoading && (
                       <ErrorBanner error={messageError} />
                     )}
+                    {/* Tail mode: main turn finished but a dispatched subagent is
+                        still running in the backend. Independent of stop. */}
                     {hasActiveSubagents && !isLoading && (
                       <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground">
                         <span className="relative flex h-2 w-2">
@@ -2265,7 +2527,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       ref={chatInputRef}
                       onSend={handleSendWithAttachments}
                       disabled={isLoadingHistory || !workspaceId || !!pendingInterrupt}
-                      onStop={handleSoftInterrupt}
+                      onStop={handleStop}
                       isLoading={isLoading}
                       placeholder={chatPlaceholder}
                       files={workspaceFiles}
@@ -2368,6 +2630,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   onTargetMemoryHandled={handleTargetMemoryHandled}
                   targetMemoKey={filePanelTargetMemoKey}
                   onTargetMemoHandled={handleTargetMemoHandled}
+                  targetSources={filePanelTargetSources}
+                  sourcesRecords={sourcesRecords}
+                  allSourcesRecords={allSourcesRecords}
                   onOpenFile={handleOpenFileFromChat}
                   files={workspaceFiles}
                   filesLoading={filesLoading}
@@ -2383,6 +2648,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   }}
                   readOnly={isFlashMode}
                   singleFileMode={isFlashMode && !!filePanelWorkspaceId}
+                  onCopyShareLink={isFlashMode ? null : handleCopyShareLink}
                 />
                 </WorkspaceProvider>
               </Suspense>
@@ -2427,6 +2693,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       onTargetMemoryHandled={handleTargetMemoryHandled}
                       targetMemoKey={filePanelTargetMemoKey}
                       onTargetMemoHandled={handleTargetMemoHandled}
+                      targetSources={filePanelTargetSources}
+                      sourcesRecords={sourcesRecords}
+                      allSourcesRecords={allSourcesRecords}
                       onOpenFile={handleOpenFileFromChat}
                       files={workspaceFiles}
                       filesLoading={filesLoading}
@@ -2442,6 +2711,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       }}
                       readOnly={isFlashMode}
                       singleFileMode={isFlashMode && !!filePanelWorkspaceId}
+                      onCopyShareLink={isFlashMode ? null : handleCopyShareLink}
                     />
                     </WorkspaceProvider>
                   ) : rightPanelType === 'detail' && (detailToolCall || detailPlanData) ? (

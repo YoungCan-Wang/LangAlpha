@@ -6,6 +6,7 @@ Extracted from src/server/app/workflow.py to separate business logic from route 
 
 import asyncio
 import logging
+from typing import Optional
 
 from fastapi import HTTPException
 
@@ -57,14 +58,26 @@ def extract_state_values(checkpoint_tuple) -> dict:
     return channel_values
 
 
-async def cancel_workflow(thread_id: str) -> dict:
+async def cancel_workflow(thread_id: str, run_id: Optional[str] = None) -> dict:
     """
-    Explicitly cancel a workflow execution.
+    Explicitly cancel a workflow execution (user stop).
 
-    Sets cancellation flag that the streaming generator will check.
+    Signal-only: sets the cancel flag, marks status, and force-cancels the
+    in-flight task via ``manager.cancel_workflow`` (which interrupts the
+    current step immediately). The subagent kill + registry wipe is owned by
+    the single-owner teardown in ``BackgroundTaskManager`` when the
+    ``CancelledError`` lands — this handler only runs ``cancel_and_clear`` as a
+    safety net when no active task exists (e.g. an orphaned registry left by a
+    crash), so the deterministic teardown sequence (flush → drain → clear →
+    persist) isn't raced.
+
+    ``run_id`` targets a specific run so a slow/retried stop can't cancel a
+    *newer* turn the user started after the stopped one finished (the manager
+    otherwise falls back to "latest active run"). Omitted = latest active run.
 
     Args:
         thread_id: Thread ID to cancel
+        run_id: Specific run to cancel; None falls back to the latest active run
 
     Returns:
         Confirmation of cancellation with thread_id
@@ -91,25 +104,31 @@ async def cancel_workflow(thread_id: str) -> dict:
         )
 
         manager = BackgroundTaskManager.get_instance()
-        cancel_success = await manager.cancel_workflow(thread_id)
+        cancel_success = await manager.cancel_workflow(thread_id, run_id)
 
-        if not cancel_success:
+        if not cancel_success and not await manager.has_active_task_for_thread(
+            thread_id
+        ):
             logger.warning(
                 f"Could not cancel background task for {thread_id} "
                 "(may be already completed or not found)"
             )
+            # Safety net: no active task owns the teardown, so wipe any
+            # orphaned registry left behind (e.g. after a crash). When a task
+            # IS active, its except-handler teardown owns cancel_and_clear and
+            # we must NOT race it here — nor wipe a *different* still-running
+            # turn's registry when a run-targeted cancel missed its run.
+            from src.server.services.background_registry_store import (
+                BackgroundRegistryStore,
+            )
+
+            registry_store = BackgroundRegistryStore.get_instance()
+            await registry_store.cancel_and_clear(thread_id, force=True)
 
         if not success:
             logger.warning(
                 f"Failed to set cancel flag for {thread_id} (Redis may be unavailable)"
             )
-
-        from src.server.services.background_registry_store import (
-            BackgroundRegistryStore,
-        )
-
-        registry_store = BackgroundRegistryStore.get_instance()
-        await registry_store.cancel_and_clear(thread_id, force=True)
 
         logger.info(f"Workflow cancelled: {thread_id}")
 
@@ -123,37 +142,6 @@ async def cancel_workflow(thread_id: str) -> dict:
         logger.exception(f"Error cancelling workflow {thread_id}: {e}")
         raise HTTPException(
             status_code=500, detail=f"Failed to cancel workflow: {str(e)}"
-        )
-
-
-async def soft_interrupt_workflow(thread_id: str) -> dict:
-    """
-    Soft interrupt a workflow - pause main agent, keep subagents running.
-
-    Args:
-        thread_id: Thread ID to soft interrupt
-
-    Returns:
-        Status including whether workflow can be resumed and active subagents
-    """
-    try:
-        from src.server.services.background_task_manager import BackgroundTaskManager
-
-        manager = BackgroundTaskManager.get_instance()
-
-        result = await manager.soft_interrupt_workflow(thread_id)
-
-        logger.info(
-            f"Workflow soft interrupted: {thread_id}, "
-            f"background_tasks={result.get('background_tasks', [])}"
-        )
-
-        return result
-
-    except Exception as e:
-        logger.exception(f"Error soft interrupting workflow {thread_id}: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to soft interrupt workflow: {str(e)}"
         )
 
 
@@ -224,7 +212,6 @@ async def get_workflow_status(thread_id: str) -> dict:
 
         # Get subagent info from background task manager
         active_tasks = []
-        soft_interrupted = False
         run_id = None
 
         try:
@@ -236,7 +223,6 @@ async def get_workflow_status(thread_id: str) -> dict:
             bg_status = await manager.get_workflow_status(thread_id)
             if bg_status.get("status") != "not_found":
                 active_tasks = bg_status.get("active_tasks", [])
-                soft_interrupted = bg_status.get("soft_interrupted", False)
                 run_id = bg_status.get("run_id")
             elif can_reconnect:
                 # Redis says active/disconnected but BackgroundTaskManager has no
@@ -293,7 +279,6 @@ async def get_workflow_status(thread_id: str) -> dict:
             "user_id": user_id,
             "progress": checkpoint_info,
             "active_tasks": active_tasks,
-            "soft_interrupted": soft_interrupted,
             "is_shared": is_shared,
             "pending_report_back": pending_report_back,
         }
@@ -724,26 +709,14 @@ async def trigger_offload(thread_id: str) -> dict:
 
 
 async def _persist_context_window_event(thread_id: str, data: dict) -> None:
-    """Append a context_window SSE event to the last response's sse_events for replay.
+    """Append a context_window SSE event to the latest response's sse_events for replay.
 
-    Best-effort: logs warnings on failure but never raises.
+    Best-effort: logs warnings on failure but never raises. Uses a server-side
+    JSONB append so we never read or rewrite the whole sse_events blob per model
+    call (the old read-modify-write also clobbered concurrent appends).
     """
     try:
-        from src.server.database.conversation import (
-            get_responses_for_thread,
-            update_sse_events,
-        )
-
-        responses, _ = await get_responses_for_thread(thread_id)
-        if not responses:
-            logger.debug(
-                f"No responses found for thread {thread_id}, skipping context_window persist"
-            )
-            return
-
-        last_response = responses[-1]
-        resp_id = str(last_response["conversation_response_id"])
-        existing_events = last_response.get("sse_events") or []
+        from src.server.database.conversation import append_sse_event
 
         cw_event = {
             "event": "context_window",
@@ -753,8 +726,12 @@ async def _persist_context_window_event(thread_id: str, data: dict) -> None:
                 **data,
             },
         }
-        existing_events.append(cw_event)
-        await update_sse_events(resp_id, existing_events)
+        updated = await append_sse_event(thread_id, cw_event)
+        if not updated:
+            logger.debug(
+                f"No responses found for thread {thread_id}, skipping context_window persist"
+            )
+            return
 
         logger.debug(
             f"Persisted context_window event ({data.get('action')}) "
